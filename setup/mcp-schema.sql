@@ -8,7 +8,6 @@
 --   the Mcp schema: one view per read made by a tool or a resource of modules 1 to 7, and the
 --   two procedures that are the only way the server writes. A person appears in a view by
 --   display name only, never by email, phone or birth date.
--- Mcp.TrainerMonth is not created here: the exercise of module 8 writes it.
 USE [$(DB)];
 GO
 IF USER_ID(N'pacha_app') IS NULL CREATE USER pacha_app FOR LOGIN pacha_app;
@@ -91,6 +90,22 @@ FROM Enrollment.Enrollment AS e
 JOIN Course.Session AS s ON s.SessionId = e.SessionId
 JOIN Course.Course AS c ON c.CourseId = s.CourseId
 LEFT JOIN Contact.Contact AS ct ON ct.ContactId = e.ContactId;
+GO
+
+-- trainer_load and the resource template pachatraining://trainer/{trainer_id}/month/{month}
+-- (exercise of module 8). One row per trainer and month with engagements, the month as
+-- YYYY-MM; a trainer without any engagement has one row whose Month is NULL, so that the
+-- server tells an idle trainer from an unknown one.
+CREATE OR ALTER VIEW Mcp.TrainerMonth AS
+SELECT t.TrainerId, m.Month, ISNULL(m.SessionCount, 0) AS SessionCount,
+       ISNULL(m.DayCount, 0) AS DayCount
+FROM Trainer.Trainer AS t
+OUTER APPLY (SELECT CONVERT(char(7), s.StartDate, 126) AS Month, COUNT(*) AS SessionCount,
+                    SUM(e.DayCount) AS DayCount
+             FROM Trainer.Engagement AS e
+             JOIN Course.Session AS s ON s.SessionId = e.SessionId
+             WHERE e.TrainerId = t.TrainerId
+             GROUP BY CONVERT(char(7), s.StartDate, 126)) AS m;
 GO
 
 -- Where Mcp.CancelEnrollment keeps the reason: Enrollment.Enrollment has no column for it.

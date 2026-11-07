@@ -14,12 +14,13 @@ c=mcpcourse
 # 1. The passwords. They live in .env only (ignored by git), never in a committed file.
 pw() { printf '%s-Aa1' "$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)"; }
 if [ ! -f .env ]; then
-    app=$(pw)
+    # The server connects as mcp_reader, the account of module 8 on.
+    reader=$(pw)
     umask 077
     sed -e "s/^MSSQL_SA_PASSWORD=.*/MSSQL_SA_PASSWORD=$(pw)/" \
-        -e "s/^PACHA_APP_PASSWORD=.*/PACHA_APP_PASSWORD=$app/" \
-        -e "s/^MCP_READER_PASSWORD=.*/MCP_READER_PASSWORD=$(pw)/" \
-        -e "s/^PACHA_SQL_PASSWORD=.*/PACHA_SQL_PASSWORD=$app/" \
+        -e "s/^PACHA_APP_PASSWORD=.*/PACHA_APP_PASSWORD=$(pw)/" \
+        -e "s/^MCP_READER_PASSWORD=.*/MCP_READER_PASSWORD=$reader/" \
+        -e "s/^PACHA_SQL_PASSWORD=.*/PACHA_SQL_PASSWORD=$reader/" \
         .env.example > .env
     umask 022
     echo "Wrote .env with new random passwords."

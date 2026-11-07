@@ -7,6 +7,7 @@ write refuse before anything is read or asked.
 """
 
 import os
+import secrets
 import subprocess
 from datetime import date
 
@@ -100,3 +101,21 @@ def test_a_confirmation_belongs_to_its_caller():
     assert by_bob.json()["error"]["message"] == "Invalid or expired requestState"
     assert by_alice.json()["result"]["structuredContent"]["message"].startswith(
         "The user declined")
+
+
+def test_a_reader_may_read_and_not_write():
+    """A token of PACHA_READ_TOKENS: the tools that read answer it, the tools that write
+    refuse it before the confirmation."""
+    reader = secrets.token_urlsafe(32)
+    with http_server(PACHA_READ_TOKENS=f"carol:{reader}") as port:
+        week = post(port, "tools/call", {"name": "sessions_in_week",
+                                         "arguments": {"monday": "2026-11-16"}},
+                    name="sessions_in_week", token=reader).json()["result"]
+        refused = post(port, "tools/call", {"name": "postpone_session", "arguments": POSTPONE},
+                       name="postpone_session", token=reader).json()["result"]
+        asked = post(port, "tools/call", {"name": "postpone_session", "arguments": POSTPONE},
+                     name="postpone_session").json()["result"]
+    assert week["structuredContent"]["count"] == 36
+    assert refused.get("resultType") != "input_required" and refused["isError"] is True
+    assert "carol may only read" in refused["content"][0]["text"]
+    assert asked["resultType"] == "input_required"

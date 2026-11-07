@@ -87,13 +87,18 @@ HTTP_PORT = int(os.environ.get("PACHA_HTTP_PORT", "8000"))
 RESOURCE = f"http://127.0.0.1:{HTTP_PORT}/mcp"
 
 
-def team_tokens() -> dict[str, str]:
-    """The tokens of PACHA_TOKENS, each with the name of the colleague it was given to.
+# What a token may do. Every token reads; only the tokens of PACHA_TOKENS write.
+READ, WRITE = "pacha:read", "pacha:write"
 
-    PACHA_TOKENS holds name:token pairs separated by commas (alice:Xy...,bob:Zt...). A token
-    is drawn once per colleague with setup/new_token.py, and stays in .env, never in git."""
+
+def team_tokens(variable: str = "PACHA_TOKENS") -> dict[str, str]:
+    """The tokens of one variable, each with the name of the colleague it was given to.
+
+    PACHA_TOKENS and PACHA_READ_TOKENS hold name:token pairs separated by commas
+    (alice:Xy...,bob:Zt...). A token is drawn once per colleague with setup/new_token.py,
+    and stays in .env, never in git."""
     tokens = {}
-    for pair in os.environ.get("PACHA_TOKENS", "").split(","):
+    for pair in os.environ.get(variable, "").split(","):
         name, _, token = pair.strip().partition(":")
         if name and token:
             tokens[token] = name
@@ -101,28 +106,32 @@ def team_tokens() -> dict[str, str]:
 
 
 class TeamTokens(TokenVerifier):
-    """Accept the tokens of PACHA_TOKENS, and say on stderr who each HTTP request comes from.
+    """Accept the tokens of PACHA_TOKENS (read and write) and of PACHA_READ_TOKENS (read only),
+    and say on stderr who each HTTP request comes from.
 
     The SDK calls verify_token for every HTTP request that carries a bearer token. The log
     names the colleague, never the token: a log is read by more people than .env."""
 
-    def __init__(self, tokens: dict[str, str]):
-        self.tokens = tokens
+    def __init__(self, writers: dict[str, str], readers: dict[str, str]):
+        self.scopes = {token: [READ, WRITE] for token in writers}
+        self.scopes.update({token: [READ] for token in readers if token not in writers})
+        self.names = {**readers, **writers}
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        name = self.tokens.get(token)
-        if name is None:
+        scopes = self.scopes.get(token)
+        if scopes is None:
             log.warning("HTTP request refused: unknown token")
             return None
-        log.info("HTTP request from %s", name)
-        return AccessToken(token=token, client_id=name, scopes=[], resource=RESOURCE)
+        log.info("HTTP request from %s (%s)", self.names[token], " ".join(scopes))
+        return AccessToken(token=token, client_id=self.names[token], scopes=scopes,
+                           resource=RESOURCE)
 
 
 mcp = MCPServer(
     "pachatraining", lifespan=lifespan, request_state_security=request_state_security(),
     # Over HTTP, a request without a known token gets 401 before any JSON-RPC is read.
     # Over stdio and in memory there is no Authorization header: the verifier is never called.
-    token_verifier=TeamTokens(team_tokens()),
+    token_verifier=TeamTokens(team_tokens(), team_tokens("PACHA_READ_TOKENS")),
     auth=AuthSettings(
         # No authorization server issues these tokens: they are drawn and handed out by
         # hand. AuthSettings asks for an issuer all the same, and the protected resource
@@ -130,6 +139,8 @@ mcp = MCPServer(
         issuer_url=AnyHttpUrl(f"http://127.0.0.1:{HTTP_PORT}"),
         resource_server_url=AnyHttpUrl(RESOURCE),
         validate_token_resource=True,
+        # Every token must read: the SDK answers 403 to one without pacha:read.
+        required_scopes=[READ],
     ),
 )
 
@@ -682,7 +693,7 @@ class Caller(BaseModel):
 
 async def writer() -> Caller:
     """Resolver: who calls a tool that writes. The other resolvers of these tools depend on
-    it, so a caller without a token is refused before the database is read or anyone is
+    it, so a caller who may not write is refused before the database is read or anyone is
     asked to confirm.
 
     Over stdio and in memory there is no token at all, and the tools that write refuse."""
@@ -690,6 +701,9 @@ async def writer() -> Caller:
     if token is None:
         raise ToolError("This tool writes, and writes only for a caller with a team token: "
                         "serve over HTTP (pachatraining-mcp --http) and send the token.")
+    if WRITE not in token.scopes:
+        raise ToolError(f"Not allowed: the token of {token.client_id} may only read, and this "
+                        "tool writes. Ask for a token of PACHA_TOKENS.")
     return Caller(name=token.client_id)
 
 
@@ -902,10 +916,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="pachatraining-mcp")
     parser.add_argument("--http", action="store_true",
                         help="serve Streamable HTTP on 127.0.0.1, port PACHA_HTTP_PORT (8000), "
-                             "to the holders of a token of PACHA_TOKENS")
+                             "to the holders of a token of PACHA_TOKENS or PACHA_READ_TOKENS")
     args = parser.parse_args()
     if args.http:
-        if not team_tokens():
+        if not team_tokens() and not team_tokens("PACHA_READ_TOKENS"):
             parser.error("PACHA_TOKENS is empty: over HTTP, every request would get 401. "
                          "Draw a token with: uv run python setup/new_token.py <name>")
         # 127.0.0.1 only: the team's names are the Host headers a proxy in front will send.

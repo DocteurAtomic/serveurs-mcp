@@ -67,5 +67,38 @@ def sessions_in_week(monday: date) -> list[SessionRow]:
         ]
 
 
+class SessionDetail(BaseModel):
+    session_id: int
+    course_code: str
+    title: str | None
+    start_date: date
+    status: str
+    enrolled: int
+
+
+@mcp.tool()
+def session_detail(session_id: int) -> SessionDetail:
+    """Describe one training session: course code, English title, start date, status and
+    number of enrollments that are not cancelled."""
+    with connect() as cn:
+        cur = cn.cursor()
+        cur.execute(
+            """SELECT s.SessionId, c.Code, cl.Title, s.StartDate, s.StatusCode,
+                      (SELECT COUNT(*) FROM Enrollment.Enrollment AS e
+                       WHERE e.SessionId = s.SessionId AND e.CancellationDate IS NULL)
+               FROM Course.Session AS s
+               JOIN Course.Course AS c ON c.CourseId = s.CourseId
+               LEFT JOIN Course.CourseLanguage AS cl
+                      ON cl.CourseId = s.CourseId AND cl.LanguageCode = 'EN'
+               WHERE s.SessionId = ?""",
+            (session_id,),
+        )
+        r = cur.fetchone()
+    if r is None:
+        raise ValueError(f"Session {session_id} not found.")
+    return SessionDetail(session_id=r[0], course_code=r[1], title=r[2], start_date=r[3],
+                         status=r[4].strip(), enrolled=r[5])
+
+
 def main() -> None:
     mcp.run()

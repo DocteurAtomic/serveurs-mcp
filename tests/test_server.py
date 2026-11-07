@@ -22,3 +22,14 @@ async def test_sessions_in_week():
         rows = result.structured_content["result"]
         assert len(rows) == 36
         assert rows[0]["session_id"] == 17709
+
+
+@pytest.mark.anyio
+async def test_session_detail():
+    async with Client(mcp) as client:
+        result = await client.call_tool("session_detail", {"session_id": 17709})
+        missing = await client.call_tool("session_detail", {"session_id": 99999})
+    assert not result.is_error
+    assert result.structured_content["course_code"] == "LNX-ADM2"
+    assert result.structured_content["enrolled"] == 6
+    assert missing.is_error

@@ -1,11 +1,16 @@
 """The pachatraining MCP server: what PachaData's teams ask of the training database."""
 
+import base64
+import json
 import os
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Annotated, Literal
 
+import anyio.to_thread
 import mssql_python
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ResourceNotFoundError, ToolError
@@ -35,14 +40,30 @@ def load_env(path: Path = ENV_FILE) -> None:
 
 
 load_env()
-mcp = MCPServer("pachatraining")
+
+# The SDK runs a plain def handler in a thread, 40 at most at once (anyio's default limiter).
+# A full pool refuses a connection instead of waiting for one, so it is never smaller.
+POOL_SIZE = 40
+
+
+@asynccontextmanager
+async def lifespan(server: MCPServer) -> AsyncIterator[None]:
+    """Size the connection pool before the first connection: once the pool is on, pooling()
+    returns without changing anything. Connections are not opened here: each call takes its
+    own, since a connection serves one command at a time (mssql_python.threadsafety is 1)."""
+    mssql_python.pooling(max_size=POOL_SIZE, idle_timeout=600)
+    yield
+
+
+mcp = MCPServer("pachatraining", lifespan=lifespan)
 
 # Every tool of this server only reads, and only reads the training database.
 READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 
 
 def connect() -> mssql_python.Connection:
-    """Open a connection with the account of .env (pacha_app), never sa."""
+    """Open a connection with the account of .env (pacha_app), never sa. Use it in a with
+    block: leaving the block hands the connection back to the pool."""
     return mssql_python.connect(
         f"Server={os.environ['PACHA_SQL_SERVER']};"
         f"Database={os.environ.get('PACHA_SQL_DATABASE', 'PachadataTraining')};"
@@ -277,10 +298,12 @@ async def complete(
     context: CompletionContext | None,
 ) -> Completion | None:
     """Suggest course codes for the course sheet, and Mondays for the review of a week."""
+    # The handler is async and the driver is not: a query run here directly would hold the
+    # event loop, and every other request with it, until it returns.
     if isinstance(ref, ResourceTemplateReference) and argument.name == "code":
-        values, total = course_codes(argument.value)
+        values, total = await anyio.to_thread.run_sync(course_codes, argument.value)
     elif isinstance(ref, PromptReference) and argument.name == "monday":
-        values, total = mondays(argument.value)
+        values, total = await anyio.to_thread.run_sync(mondays, argument.value)
     else:
         return None
     # A response holds 100 values at most: total and has_more say what was left out.
@@ -316,6 +339,108 @@ def trainer_review(
         "3. Say in one sentence whether the load looks light, normal or heavy for one month.\n\n"
         "Rely on the tool result only, and write the review in French."
     )
+
+
+PAGE_SIZE = 50
+
+
+class UnpaidInvoice(BaseModel):
+    invoice_code: str
+    due_date: date
+    client: Annotated[str, Field(description="Company name, or the trainee's name.")]
+    amount_due: Annotated[float, Field(description="Gross amount minus the payments, in euros.")]
+
+
+class UnpaidPage(BaseModel):
+    as_of: date
+    days: int
+    total: Annotated[int, Field(description="Unpaid invoices over all pages, not this one.")]
+    total_due: Annotated[float, Field(description="Amount due over all pages, in euros.")]
+    invoices: list[UnpaidInvoice]
+    next_cursor: Annotated[
+        str | None,
+        Field(description="Pass it back as cursor for the next page; absent on the last page."),
+    ] = None
+
+
+class _Position(BaseModel):
+    """What a cursor holds: the arguments of the first call, and the last row sent."""
+    as_of: date
+    days: int
+    due_date: date
+    invoice_code: str
+
+
+def _encode(position: _Position) -> str:
+    return base64.urlsafe_b64encode(position.model_dump_json().encode()).decode()
+
+
+def _decode(cursor: str, as_of: date, days: int) -> _Position:
+    try:
+        position = _Position.model_validate_json(base64.urlsafe_b64decode(cursor.encode()))
+    except ValueError:
+        raise ToolError("Invalid cursor: pass back the next_cursor of the previous page as is.")
+    if (position.as_of, position.days) != (as_of, days):
+        raise ToolError("This cursor belongs to another as_of or days: start again without it.")
+    return position
+
+
+# Invoices only (DocumentType 'I'; 'A' is a credit note), whose payments do not cover the gross
+# amount, due before the cut-off date. Payments are summed whatever their date.
+UNPAID = """
+    FROM Enrollment.Invoice AS i
+    LEFT JOIN (SELECT InvoiceCode, SUM(Amount) AS Paid
+               FROM Enrollment.Payment GROUP BY InvoiceCode) AS p
+           ON p.InvoiceCode = i.InvoiceCode
+    LEFT JOIN Contact.Company AS co ON co.CompanyId = i.CompanyId
+    LEFT JOIN Contact.Contact AS ct ON ct.ContactId = i.ContactId
+    WHERE i.DocumentType = 'I' AND i.GrossAmount > ISNULL(p.Paid, 0) AND i.DueDate < ?"""
+
+
+@mcp.tool(title="Unpaid invoices", annotations=READ_ONLY)
+def unpaid_invoices(
+    as_of: Annotated[date, Field(description="Date the debts are counted at, as an ISO date.")],
+    days: Annotated[
+        int, Field(ge=0, le=3650, description="Days past the due date; 30 by default.")
+    ] = 30,
+    cursor: Annotated[
+        str | None, Field(description="next_cursor of the previous page; omit for the first.")
+    ] = None,
+) -> UnpaidPage:
+    """List the invoices still unpaid more than `days` days after their due date, at `as_of`,
+    oldest due date first, 50 per page. `total` and `total_due` cover all pages: when
+    `next_cursor` is present, call again with it to get the next page.
+    """
+    cutoff = as_of - timedelta(days=days)
+    after = _decode(cursor, as_of, days) if cursor else None
+    with connect() as cn:
+        cur = cn.cursor()
+        cur.execute(f"SELECT COUNT(*), SUM(i.GrossAmount - ISNULL(p.Paid, 0)) {UNPAID}", (cutoff,))
+        total, total_due = cur.fetchone()
+        # One row more than a page says whether there is a next one. The order is unique
+        # (InvoiceCode breaks the ties of DueDate), so the pages never overlap nor skip a row.
+        cur.execute(
+            f"""SELECT TOP (?) i.InvoiceCode, i.DueDate,
+                       COALESCE(co.Name, CONCAT(ct.FirstName, ' ', ct.LastName)),
+                       i.GrossAmount - ISNULL(p.Paid, 0)
+                {UNPAID}
+                  AND (? IS NULL OR i.DueDate > ? OR (i.DueDate = ? AND i.InvoiceCode > ?))
+                ORDER BY i.DueDate, i.InvoiceCode""",
+            (PAGE_SIZE + 1, cutoff,
+             after and after.due_date, after and after.due_date, after and after.due_date,
+             after and after.invoice_code),
+        )
+        rows = cur.fetchall()
+    invoices = [UnpaidInvoice(invoice_code=r[0], due_date=r[1], client=r[2],
+                              amount_due=float(r[3]))
+                for r in rows[:PAGE_SIZE]]
+    next_cursor = None
+    if len(rows) > PAGE_SIZE:
+        last = invoices[-1]
+        next_cursor = _encode(_Position(as_of=as_of, days=days, due_date=last.due_date,
+                                        invoice_code=last.invoice_code))
+    return UnpaidPage(as_of=as_of, days=days, total=total, total_due=float(total_due or 0),
+                      invoices=invoices, next_cursor=next_cursor)
 
 
 def main() -> None:

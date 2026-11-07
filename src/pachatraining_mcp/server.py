@@ -3,10 +3,13 @@
 import os
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Annotated, Literal
 
 import mssql_python
 from mcp.server import MCPServer
-from pydantic import BaseModel
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
+from pydantic import BaseModel, Field
 
 # The .env at the root of the project, wherever the host starts the server from.
 ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
@@ -26,6 +29,9 @@ def load_env(path: Path = ENV_FILE) -> None:
 load_env()
 mcp = MCPServer("pachatraining")
 
+# Every tool of this server only reads, and only reads the training database.
+READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
+
 
 def connect() -> mssql_python.Connection:
     """Open a connection with the account of .env (pacha_app), never sa."""
@@ -37,17 +43,38 @@ def connect() -> mssql_python.Connection:
     )
 
 
+# The five rows of Course.SessionStatus.
+Status = Literal["CANCELED", "COMPLETED", "CONFIRMED", "OPEN", "PLANNED"]
+
+
 class SessionRow(BaseModel):
     session_id: int
     start_date: date
     course_code: str
     title: str | None
-    status: str
+    status: Status
 
 
-@mcp.tool()
-def sessions_in_week(monday: date) -> list[SessionRow]:
-    """List the training sessions that start in the week beginning on `monday` (ISO date)."""
+class WeekPlan(BaseModel):
+    monday: date
+    count: Annotated[int, Field(description="Number of sessions in `sessions`.")]
+    sessions: list[SessionRow]
+
+
+@mcp.tool(title="Sessions of a week", annotations=READ_ONLY)
+def sessions_in_week(
+    monday: Annotated[date, Field(description="Monday of the week, as an ISO date (2026-11-16).")],
+    status: Annotated[
+        Status | None,
+        Field(description="Keep only the sessions in this status; all statuses if omitted."),
+    ] = None,
+) -> WeekPlan:
+    """List the training sessions that start from `monday` to the next Sunday, one row per
+    session: id, start date, course code, English title, status.
+
+    Use it to find sessions by date. It does not count enrollments: for one session whose id
+    you know, call `session_detail`.
+    """
     with connect() as cn:
         cur = cn.cursor()
         cur.execute(
@@ -57,14 +84,16 @@ def sessions_in_week(monday: date) -> list[SessionRow]:
                LEFT JOIN Course.CourseLanguage AS cl
                       ON cl.CourseId = s.CourseId AND cl.LanguageCode = 'EN'
                WHERE s.StartDate >= ? AND s.StartDate < ?
+                 AND (? IS NULL OR s.StatusCode = ?)
                ORDER BY s.StartDate, s.SessionId""",
-            (monday, monday + timedelta(days=7)),
+            (monday, monday + timedelta(days=7), status, status),
         )
-        return [
+        rows = [
             SessionRow(session_id=r[0], start_date=r[1], course_code=r[2],
                        title=r[3], status=r[4].strip())
             for r in cur.fetchall()
         ]
+    return WeekPlan(monday=monday, count=len(rows), sessions=rows)
 
 
 class SessionDetail(BaseModel):
@@ -72,14 +101,21 @@ class SessionDetail(BaseModel):
     course_code: str
     title: str | None
     start_date: date
-    status: str
-    enrolled: int
+    status: Status
+    enrolled: Annotated[int, Field(description="Enrollments that are not cancelled.")]
 
 
-@mcp.tool()
-def session_detail(session_id: int) -> SessionDetail:
-    """Describe one training session: course code, English title, start date, status and
-    number of enrollments that are not cancelled."""
+@mcp.tool(title="Detail of a session", annotations=READ_ONLY)
+def session_detail(
+    session_id: Annotated[
+        int, Field(ge=1, description="Id of the session, as listed by sessions_in_week.")
+    ],
+) -> SessionDetail:
+    """Describe one training session whose id you know: course code, English title, start
+    date, status, and the number of trainees enrolled (cancelled enrollments not counted).
+
+    To find a session by date, call `sessions_in_week` first.
+    """
     with connect() as cn:
         cur = cn.cursor()
         cur.execute(
@@ -95,7 +131,8 @@ def session_detail(session_id: int) -> SessionDetail:
         )
         r = cur.fetchone()
     if r is None:
-        raise ValueError(f"Session {session_id} not found.")
+        # A ToolError reaches the model with its message; any other exception would not.
+        raise ToolError(f"Session {session_id} not found.")
     return SessionDetail(session_id=r[0], course_code=r[1], title=r[2], start_date=r[3],
                          status=r[4].strip(), enrolled=r[5])
 

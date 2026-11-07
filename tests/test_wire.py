@@ -28,7 +28,7 @@ async def test_wire_log_of_one_start(mode, revision, first_method):
     async with Client(params, mode=mode) as client:
         assert client.protocol_version == revision
         result = await client.call_tool("sessions_in_week", {"monday": "2026-11-16"})
-    assert len(result.structured_content["result"]) == 36
+    assert result.structured_content["count"] == 36
     wire = summarize(tag, ROOT / "logs")
     assert wire.revision == revision
     assert wire.first_method == first_method

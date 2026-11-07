@@ -11,11 +11,6 @@ ROOT = Path(__file__).resolve().parents[1]
 WIRE = str(ROOT / "tools" / "wire.sh")
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     ("mode", "revision", "first_method"),
@@ -28,6 +23,7 @@ async def test_wire_log_of_one_start(mode, revision, first_method):
     async with Client(params, mode=mode) as client:
         assert client.protocol_version == revision
         result = await client.call_tool("sessions_in_week", {"monday": "2026-11-16"})
+    assert not result.is_error, result.content[0].text
     assert result.structured_content["count"] == 36
     wire = summarize(tag, ROOT / "logs")
     assert wire.revision == revision

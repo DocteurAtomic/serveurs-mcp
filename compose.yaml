@@ -23,5 +23,29 @@ services:
       interval: 5s
       timeout: 5s
       retries: 30
+  # The authorization server of module 12: Keycloak, which imports the pachadata realm of
+  # setup/keycloak/ when it starts, its ${...} values read from .env. In the oauth profile, so
+  # ./setup/install.sh and the CI do not start it: ./setup/keycloak.py does, after filling its
+  # secrets in .env. Development mode, plain HTTP on 127.0.0.1 only, about 1 GB of memory.
+  # CIMD and RFC 8707 (resource indicators) are experimental features of 26.8.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.2
+    profiles: [oauth]
+    container_name: mcpcourse-keycloak
+    command: ["start-dev", "--import-realm", "--features=cimd,resource-indicators"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-}
+      KEYCLOAK_ALICE_PASSWORD: ${KEYCLOAK_ALICE_PASSWORD:-}
+      KEYCLOAK_CAROL_PASSWORD: ${KEYCLOAK_CAROL_PASSWORD:-}
+      KEYCLOAK_MCP_SECRET: ${KEYCLOAK_MCP_SECRET:-}
+      KEYCLOAK_CHECK_SECRET: ${KEYCLOAK_CHECK_SECRET:-}
+      # The URL of the MCP server, written in the audience of the tokens.
+      PACHA_MCP_URL: ${PACHA_MCP_URL:-http://127.0.0.1:8000/mcp}
+    ports:
+      - "127.0.0.1:${KEYCLOAK_PORT:-8080}:8080"
+    mem_limit: 1536m
+    volumes:
+      - ./setup/keycloak:/opt/keycloak/data/import:ro,z
 volumes:
   sqldata:

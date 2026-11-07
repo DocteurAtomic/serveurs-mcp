@@ -4,7 +4,10 @@
 
 Listens on 127.0.0.1:<port> and forwards every request to http://127.0.0.1:<server-port>/mcp:
 register http://127.0.0.1:<port>/mcp in the host instead of the server, as tools/wire.sh is
-registered instead of the stdio command. Writes three files, overwritten at each start:
+registered instead of the stdio command. The protected resource metadata is forwarded too,
+unrecorded, so that a client can sign in to the authorization server through the proxy; the
+server then names the proxy's URL in PACHA_MCP_URL. Writes three files, overwritten at each
+start:
 
     logs/wire-<tag>.in.jsonl     the JSON-RPC messages the host posted, one per line
     logs/wire-<tag>.out.jsonl    the JSON-RPC messages the server answered, SSE events unwrapped
@@ -25,7 +28,7 @@ import httpx2
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import StreamingResponse
+from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 
 LOGS = Path(__file__).resolve().parents[1] / "logs"
@@ -39,6 +42,7 @@ def app(tag: str, server_port: int) -> Starlette:
     logs = {kind: open(LOGS / f"wire-{tag}.{kind}.jsonl", "w", buffering=1)
             for kind in ("in", "out", "http")}
     target = f"http://127.0.0.1:{server_port}/mcp"
+    metadata = f"http://127.0.0.1:{server_port}/.well-known/oauth-protected-resource/mcp"
     # The SDK client's timeouts: a response stream may stay open for minutes.
     client = httpx2.AsyncClient(timeout=httpx2.Timeout(30, read=300))
 
@@ -84,7 +88,13 @@ def app(tag: str, server_port: int) -> Starlette:
             headers={k: v for k, v in response.headers.items() if k not in HOP_HEADERS},
         )
 
-    return Starlette(routes=[Route("/mcp", forward, methods=["GET", "POST", "DELETE"])])
+    async def discovery(request: Request) -> Response:
+        response = await client.get(metadata)
+        return Response(response.content, status_code=response.status_code,
+                        media_type=response.headers.get("content-type"))
+
+    return Starlette(routes=[Route("/mcp", forward, methods=["GET", "POST", "DELETE"]),
+                             Route("/.well-known/oauth-protected-resource/mcp", discovery)])
 
 
 def main() -> None:

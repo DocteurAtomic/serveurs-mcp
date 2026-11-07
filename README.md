@@ -12,7 +12,9 @@ qu'on branche ensuite sur Claude Code.
 - Docker (ou Podman) avec `compose`, 2 Go de mémoire libre pour SQL Server et environ 9 Go de
   disque (la base de référence et ses deux copies de travail) ;
 - pour les modules qui les emploient : Node.js 24.22.1 ou plus récent dans la 24, ou 22.23.4 dans la 22 (MCP Inspector) et
-  Claude Code.
+  Claude Code ;
+- pour le module 12 : 1 Go de mémoire de plus pour Keycloak, et un accès Internet depuis son
+  conteneur (Keycloak lit sur claude.ai le document qui décrit Claude Code comme client).
 
 Le pilote `mssql-python` (Microsoft, licence MIT) s'installe par `uv` sans pilote ODBC
 système : il apporte le sien, `mssql-python-odbc`, le pilote ODBC 18 de Microsoft, gratuit
@@ -44,6 +46,22 @@ certificat auto-signé : cochez *Trust server certificate* dans SSMS.
 
 Une copie de travail se recrée par `./setup/reset-copy.sh m07` (quelques secondes) et se
 supprime par `./setup/reset-copy.sh m07 --drop`, ce qui libère 2,4 Go.
+
+## Keycloak (module 12)
+
+    uv run python setup/keycloak.py
+
+Le serveur d'autorisation du module 12 est un service à part de `compose.yaml`, dans le profil
+`oauth` : `install.sh` et la CI ne le démarrent pas. `setup/keycloak.py` tire au hasard, dans
+`.env`, le mot de passe de l'administrateur de Keycloak, ceux des deux comptes du royaume
+(`alice`, qui peut écrire, et `carol`, qui ne fait que lire) et les secrets de ses deux clients
+confidentiels, puis démarre Keycloak 26.8.2 en mode développement sur `127.0.0.1:8080` et attend
+le royaume `pachadata` (environ 20 secondes). Le royaume est importé de
+`setup/keycloak/pachadata-realm.json`, sans un clic dans la console, ses `${...}` lus dans
+`.env`. Il ne s'importe qu'à la création du conteneur : après un changement du fichier ou d'un
+secret, `docker rm -f mcpcourse-keycloak`, puis relancer le script. Avec Podman :
+`COMPOSE="podman compose" uv run python setup/keycloak.py`. La console :
+`http://127.0.0.1:8080/admin`, compte `admin`.
 
 ## Dépannage
 
@@ -84,5 +102,8 @@ Developer in the `mcpcourse` container, restores the database, creates the `pach
 Connect to `127.0.0.1,14733` (not `localhost`, which resolves to `::1` first). On an Apple
 silicon Mac, Docker Desktop emulates the `linux/amd64` image; enable Rosetta emulation in its
 settings if the container stops at startup. The `mssql-python` driver brings Microsoft's ODBC
-Driver 18 (`mssql-python-odbc`), free but under a proprietary license. The code is released
-under the MIT license.
+Driver 18 (`mssql-python-odbc`), free but under a proprietary license. Module 12 adds Keycloak, a service of the
+`oauth` profile of `compose.yaml` that neither `install.sh` nor the CI starts:
+`uv run python setup/keycloak.py` draws its secrets into `.env` and starts it on
+`127.0.0.1:8080` (1 GB more memory, and Internet access from its container). The
+code is released under the MIT license.

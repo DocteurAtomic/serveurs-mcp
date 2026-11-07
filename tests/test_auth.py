@@ -68,7 +68,7 @@ async def test_no_token_no_write():
         cancelled = await c.call_tool("cancel_enrollment", CANCEL)
     for result in (postponed, cancelled):
         assert result.is_error
-        assert "team token" in result.content[0].text
+        assert "only for a caller with a token" in result.content[0].text
     assert questions == []
     with connect(write_database()) as cn:
         cur = cn.cursor()
@@ -79,7 +79,7 @@ async def test_no_token_no_write():
 def test_http_without_tokens_does_not_start():
     done = subprocess.run(
         ["uv", "--directory", str(ROOT), "run", "--quiet", "pachatraining-mcp", "--http"],
-        env={**os.environ, "PACHA_TOKENS": "", "PACHA_HTTP_PORT": "1"},
+        env={**os.environ, "PACHA_TOKENS": "", "PACHA_OAUTH_ISSUER": "", "PACHA_HTTP_PORT": "1"},
         stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60,
     )
     assert done.returncode == 2

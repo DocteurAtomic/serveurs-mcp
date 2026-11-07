@@ -1,0 +1,335 @@
+{
+  "realm": "pachadata",
+  "enabled": true,
+  "displayName": "PachaData (lab of the course)",
+  "sslRequired": "none",
+  "accessTokenLifespan": 300,
+  "roles": {
+    "realm": [
+      {
+        "name": "pacha-writer",
+        "description": "May call the tools that write (postpone_session, cancel_enrollment): the pacha:write scope enters a token only for a user with this role"
+      },
+      {
+        "name": "offline_access",
+        "description": "Lets a client keep a refresh token (Claude Code asks for offline_access)"
+      },
+      {
+        "name": "default-roles-pachadata",
+        "description": "Roles every user of the realm has",
+        "composite": true,
+        "composites": {
+          "realm": [
+            "offline_access"
+          ]
+        }
+      }
+    ]
+  },
+  "clientScopes": [
+    {
+      "name": "basic",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "false",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "sub",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-sub-mapper",
+          "config": {
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        },
+        {
+          "name": "auth_time",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usersessionmodel-note-mapper",
+          "config": {
+            "user.session.note": "AUTH_TIME",
+            "claim.name": "auth_time",
+            "jsonType.label": "long",
+            "access.token.claim": "true",
+            "id.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "profile",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "username",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {
+            "user.attribute": "username",
+            "claim.name": "preferred_username",
+            "jsonType.label": "String",
+            "access.token.claim": "true",
+            "id.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "pacha:read",
+      "description": "Read the PachaData training catalog through the MCP server",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Read sessions and enrollments"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience-pacha-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "${PACHA_MCP_URL}",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        },
+        {
+          "name": "audience-pacha-mcp-client",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "pacha-mcp",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "pacha:write",
+      "description": "Postpone sessions and cancel enrollments through the MCP server",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Postpone sessions and cancel enrollments"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience-pacha-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "${PACHA_MCP_URL}",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        },
+        {
+          "name": "audience-pacha-mcp-client",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "pacha-mcp",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "other:api",
+      "description": "A scope for another service, used to mint a token with the wrong audience",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience-other",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "http://127.0.0.1:8001/other",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "offline_access",
+      "description": "OpenID Connect built-in scope: offline_access",
+      "protocol": "openid-connect",
+      "attributes": {
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Offline access (stay signed in)"
+      }
+    }
+  ],
+  "scopeMappings": [
+    {
+      "clientScope": "pacha:write",
+      "roles": [
+        "pacha-writer"
+      ]
+    },
+    {
+      "clientScope": "offline_access",
+      "roles": [
+        "offline_access"
+      ]
+    }
+  ],
+  "defaultDefaultClientScopes": [
+    "basic",
+    "profile",
+    "pacha:read",
+    "pacha:write"
+  ],
+  "defaultOptionalClientScopes": [
+    "offline_access"
+  ],
+  "users": [
+    {
+      "username": "alice",
+      "enabled": true,
+      "email": "alice@pachadata.example",
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Writer",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${KEYCLOAK_ALICE_PASSWORD}",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "default-roles-pachadata",
+        "pacha-writer"
+      ]
+    },
+    {
+      "username": "carol",
+      "enabled": true,
+      "email": "carol@pachadata.example",
+      "emailVerified": true,
+      "firstName": "Carol",
+      "lastName": "Reader",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${KEYCLOAK_CAROL_PASSWORD}",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "default-roles-pachadata"
+      ]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "pacha-mcp",
+      "name": "The MCP server itself: authenticates to Keycloak to introspect a token",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "${KEYCLOAK_MCP_SECRET}",
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "implicitFlowEnabled": false,
+      "attributes": {
+        "resource_url": "${PACHA_MCP_URL}"
+      }
+    },
+    {
+      "clientId": "pacha-check",
+      "name": "Test client of the checks: password grant, never a model for a real client",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "${KEYCLOAK_CHECK_SECRET}",
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "defaultClientScopes": [
+        "basic",
+        "profile"
+      ],
+      "optionalClientScopes": [
+        "pacha:read",
+        "pacha:write",
+        "other:api"
+      ],
+      "attributes": {
+        "access.token.lifespan": "300"
+      }
+    }
+  ],
+  "clientProfiles": {
+    "profiles": [
+      {
+        "name": "claude-code-cimd",
+        "description": "Claude Code sends client_id https://claude.ai/oauth/claude-code-client-metadata and a localhost callback",
+        "executors": [
+          {
+            "executor": "client-id-metadata-document",
+            "configuration": {
+              "cimd-allow-http-scheme": false,
+              "cimd-allow-permitted-domains": [
+                "claude.ai",
+                "localhost",
+                "127.0.0.1"
+              ],
+              "cimd-restrict-same-domain": false,
+              "only-allow-confidential-client": false,
+              "cimd-resource-indicator-allow-list": [
+                "${PACHA_MCP_URL}"
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "clientPolicies": {
+    "policies": [
+      {
+        "name": "claude-code-cimd",
+        "enabled": true,
+        "description": "Apply the CIMD executor to client ids that are https URLs on claude.ai",
+        "conditions": [
+          {
+            "condition": "client-id-uri",
+            "configuration": {
+              "client-id-uri-scheme": [
+                "https"
+              ],
+              "client-id-uri-allow-permitted-domains": [
+                "claude.ai"
+              ]
+            }
+          }
+        ],
+        "profiles": [
+          "claude-code-cimd"
+        ]
+      }
+    ]
+  },
+  "defaultRole": {
+    "name": "default-roles-pachadata"
+  }
+}

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import anyio.to_thread
+import jwt
 import mssql_python
 from mcp.server import MCPServer
 from mcp.server.auth.middleware.auth_context import get_access_token
@@ -82,12 +83,18 @@ def request_state_security() -> RequestStateSecurity | None:
 
 log = logging.getLogger("pachatraining")
 
-# Where the HTTP server answers: the resource the tokens are for.
+# Where the HTTP server answers.
 HTTP_PORT = int(os.environ.get("PACHA_HTTP_PORT", "8000"))
-RESOURCE = f"http://127.0.0.1:{HTTP_PORT}/mcp"
+# The resource the tokens are for: the URL the clients connect to. By default the server's
+# own address; PACHA_MCP_URL when the clients reach it by another one (the URL the
+# authorization server writes in the tokens' audience).
+RESOURCE = os.environ.get("PACHA_MCP_URL") or f"http://127.0.0.1:{HTTP_PORT}/mcp"
+# The authorization server that issues the tokens, Keycloak in the lab
+# (http://127.0.0.1:8080/realms/pachadata). Unset: the team tokens of PACHA_TOKENS.
+OAUTH_ISSUER = os.environ.get("PACHA_OAUTH_ISSUER", "").rstrip("/")
 
 
-# What a token may do. Every token reads; only the tokens of PACHA_TOKENS write.
+# What a token may do. Every token reads; only some write.
 READ, WRITE = "pacha:read", "pacha:write"
 
 
@@ -127,16 +134,66 @@ class TeamTokens(TokenVerifier):
                            resource=RESOURCE)
 
 
+def issued_token(token: str, claims: dict) -> AccessToken:
+    """The AccessToken of a token the authorization server issued for this server, from its
+    claims: the scopes of its scope claim, the user it was issued to, and who issued it."""
+    scopes = claims.get("scope", "").split()
+    user = claims.get("preferred_username", claims["sub"])
+    log.info("HTTP request from %s (%s)", user,
+             " ".join(scope for scope in (READ, WRITE) if scope in scopes))
+    return AccessToken(token=token, client_id=claims.get("azp", "unknown"), scopes=scopes,
+                       expires_at=claims["exp"], resource=RESOURCE, subject=claims["sub"],
+                       claims={"iss": claims["iss"], "preferred_username": user})
+
+
+class IssuerTokens(TokenVerifier):
+    """Accept the access tokens the authorization server of PACHA_OAUTH_ISSUER signs for this
+    server, and only them.
+
+    The signature is checked here, with the public keys the authorization server publishes
+    (JWKS): no call to it for each request, and no secret on this side. Then the issuer, the
+    expiry, and the audience, which must contain RESOURCE: a token issued for another service
+    is refused. The scopes come from the token's scope claim, which the authorization server
+    fills from the user's roles."""
+
+    def __init__(self, issuer: str):
+        self.issuer = issuer
+        # Where Keycloak publishes the keys of a realm. PyJWKClient fetches them at the first
+        # token and keeps them, and fetches again for a key id it does not know.
+        self.keys = jwt.PyJWKClient(f"{issuer}/protocol/openid-connect/certs", cache_keys=True)
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        try:
+            # The first call fetches the keys over HTTP: in a thread, like a driver call.
+            key = await anyio.to_thread.run_sync(self.keys.get_signing_key_from_jwt, token)
+            claims = jwt.decode(token, key.key, algorithms=["RS256"], issuer=self.issuer,
+                                audience=RESOURCE,
+                                options={"require": ["exp", "iss", "aud", "sub"]})
+        except jwt.PyJWTError as exc:
+            # The cause stays here: the client only gets 401, whatever the reason.
+            log.warning("HTTP request refused: %s", type(exc).__name__)
+            return None
+        return issued_token(token, claims)
+
+
+def token_verifier() -> TokenVerifier:
+    """The tokens of the authorization server when PACHA_OAUTH_ISSUER is set, the team
+    tokens otherwise. Never both: with an authorization server, a team token is refused."""
+    if OAUTH_ISSUER:
+        return IssuerTokens(OAUTH_ISSUER)
+    return TeamTokens(team_tokens(), team_tokens("PACHA_READ_TOKENS"))
+
+
 mcp = MCPServer(
     "pachatraining", lifespan=lifespan, request_state_security=request_state_security(),
-    # Over HTTP, a request without a known token gets 401 before any JSON-RPC is read.
+    # Over HTTP, a request without a valid token gets 401 before any JSON-RPC is read.
     # Over stdio and in memory there is no Authorization header: the verifier is never called.
-    token_verifier=TeamTokens(team_tokens(), team_tokens("PACHA_READ_TOKENS")),
+    token_verifier=token_verifier(),
     auth=AuthSettings(
-        # No authorization server issues these tokens: they are drawn and handed out by
-        # hand. AuthSettings asks for an issuer all the same, and the protected resource
-        # metadata names it.
-        issuer_url=AnyHttpUrl(f"http://127.0.0.1:{HTTP_PORT}"),
+        # The protected resource metadata names it, and the clients go there for a token.
+        # Without an authorization server, the team tokens are drawn by hand: AuthSettings
+        # asks for an issuer all the same, and the server names itself.
+        issuer_url=AnyHttpUrl(OAUTH_ISSUER or f"http://127.0.0.1:{HTTP_PORT}"),
         resource_server_url=AnyHttpUrl(RESOURCE),
         validate_token_resource=True,
         # Every token must read: the SDK answers 403 to one without pacha:read.
@@ -687,7 +744,8 @@ WRITES = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempoten
 
 
 class Caller(BaseModel):
-    """The colleague a tool that writes acts for: the name PACHA_TOKENS gives the token."""
+    """The colleague a tool that writes acts for: the name PACHA_TOKENS gives the token, or
+    the user name in a token of the authorization server."""
     name: str
 
 
@@ -699,12 +757,13 @@ async def writer() -> Caller:
     Over stdio and in memory there is no token at all, and the tools that write refuse."""
     token = get_access_token()
     if token is None:
-        raise ToolError("This tool writes, and writes only for a caller with a team token: "
-                        "serve over HTTP (pachatraining-mcp --http) and send the token.")
+        raise ToolError("This tool writes, and writes only for a caller with a token: "
+                        "serve over HTTP (pachatraining-mcp --http) and send one.")
+    name = (token.claims or {}).get("preferred_username", token.client_id)
     if WRITE not in token.scopes:
-        raise ToolError(f"Not allowed: the token of {token.client_id} may only read, and this "
-                        "tool writes. Ask for a token of PACHA_TOKENS.")
-    return Caller(name=token.client_id)
+        raise ToolError(f"Not allowed: {name} may only read, and this tool writes: it needs "
+                        f"the {WRITE} scope.")
+    return Caller(name=name)
 
 
 class SessionToMove(BaseModel):
@@ -916,12 +975,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="pachatraining-mcp")
     parser.add_argument("--http", action="store_true",
                         help="serve Streamable HTTP on 127.0.0.1, port PACHA_HTTP_PORT (8000), "
-                             "to the holders of a token of PACHA_TOKENS or PACHA_READ_TOKENS")
+                             "to the holders of a token of PACHA_OAUTH_ISSUER, or of "
+                             "PACHA_TOKENS or PACHA_READ_TOKENS when it is unset")
     args = parser.parse_args()
     if args.http:
-        if not team_tokens() and not team_tokens("PACHA_READ_TOKENS"):
-            parser.error("PACHA_TOKENS is empty: over HTTP, every request would get 401. "
-                         "Draw a token with: uv run python setup/new_token.py <name>")
+        if not OAUTH_ISSUER and not team_tokens() and not team_tokens("PACHA_READ_TOKENS"):
+            parser.error("PACHA_TOKENS is empty and PACHA_OAUTH_ISSUER is unset: over HTTP, "
+                         "every request would get 401. Draw a token with: "
+                         "uv run python setup/new_token.py <name>")
         # 127.0.0.1 only: the team's names are the Host headers a proxy in front will send.
         mcp.run(transport="streamable-http", host="127.0.0.1", port=HTTP_PORT,
                 transport_security=transport_security())

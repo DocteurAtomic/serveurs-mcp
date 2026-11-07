@@ -3,7 +3,9 @@
 The in-memory client goes through no transport, so it sends no Authorization header: over it
 the server sees no caller at all. The tests that need a caller, the tools that write among
 them, talk to a real process on a free port of 127.0.0.1, with tokens drawn for the run and
-passed through the environment, never written to a file.
+passed through the environment, never written to a file. The team tokens only: an
+authorization server of .env (PACHA_OAUTH_ISSUER) and its URL (PACHA_MCP_URL) are blanked,
+and tests/test_oauth.py gives its own.
 """
 
 import os
@@ -56,7 +58,8 @@ def http_server(stderr: Path | None = None, **env: str):
     log = open(stderr, "w") if stderr else subprocess.DEVNULL
     process = subprocess.Popen(
         ["uv", "--directory", str(ROOT), "run", "--quiet", "pachatraining-mcp", "--http"],
-        env={**os.environ, "PACHA_HTTP_PORT": str(port), "PACHA_TOKENS": PACHA_TOKENS, **env},
+        env={**os.environ, "PACHA_HTTP_PORT": str(port), "PACHA_TOKENS": PACHA_TOKENS,
+             "PACHA_OAUTH_ISSUER": "", "PACHA_MCP_URL": "", **env},
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log,
     )
     try:

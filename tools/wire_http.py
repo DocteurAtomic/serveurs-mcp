@@ -12,6 +12,8 @@ registered instead of the stdio command. Writes three files, overwritten at each
 
 tools/wire_summary.py reads the first two as it reads a stdio log. The third is what only
 HTTP has: MCP-Protocol-Version, Mcp-Method, Mcp-Name, and Mcp-Session-Id if a session exists.
+The Authorization header is forwarded and never written: a log is read by more people than
+the token is given to.
 Stop it with Ctrl-C.
 """
 
@@ -69,7 +71,11 @@ def app(tag: str, server_port: int) -> Starlette:
                     elif kind.startswith("application/json"):
                         pending += chunk.decode()
                 if kind.startswith("application/json") and pending.strip():
-                    logs["out"].write(json.dumps(json.loads(pending)) + "\n")
+                    message = json.loads(pending)
+                    # A 401 of the auth layer is JSON too, but no JSON-RPC message: the
+                    # http log has its status, the out log keeps only what MCP answered.
+                    if isinstance(message, dict) and "jsonrpc" in message:
+                        logs["out"].write(json.dumps(message) + "\n")
             finally:
                 await response.aclose()
 

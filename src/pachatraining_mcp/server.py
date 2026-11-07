@@ -3,6 +3,7 @@
 import argparse
 import base64
 import json
+import logging
 import os
 import re
 from collections.abc import AsyncIterator
@@ -14,6 +15,9 @@ from typing import Annotated, Literal
 import anyio.to_thread
 import mssql_python
 from mcp.server import MCPServer
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import (
     AcceptedElicitation,
     CancelledElicitation,
@@ -33,7 +37,7 @@ from mcp.types import (
     ResourceTemplateReference,
     ToolAnnotations,
 )
-from pydantic import BaseModel, Field
+from pydantic import AnyHttpUrl, BaseModel, Field
 
 # The .env at the root of the project, wherever the host starts the server from.
 ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
@@ -76,8 +80,58 @@ def request_state_security() -> RequestStateSecurity | None:
     return RequestStateSecurity(keys=[key]) if key else None
 
 
-mcp = MCPServer("pachatraining", lifespan=lifespan,
-                request_state_security=request_state_security())
+log = logging.getLogger("pachatraining")
+
+# Where the HTTP server answers: the resource the tokens are for.
+HTTP_PORT = int(os.environ.get("PACHA_HTTP_PORT", "8000"))
+RESOURCE = f"http://127.0.0.1:{HTTP_PORT}/mcp"
+
+
+def team_tokens() -> dict[str, str]:
+    """The tokens of PACHA_TOKENS, each with the name of the colleague it was given to.
+
+    PACHA_TOKENS holds name:token pairs separated by commas (alice:Xy...,bob:Zt...). A token
+    is drawn once per colleague with setup/new_token.py, and stays in .env, never in git."""
+    tokens = {}
+    for pair in os.environ.get("PACHA_TOKENS", "").split(","):
+        name, _, token = pair.strip().partition(":")
+        if name and token:
+            tokens[token] = name
+    return tokens
+
+
+class TeamTokens(TokenVerifier):
+    """Accept the tokens of PACHA_TOKENS, and say on stderr who each HTTP request comes from.
+
+    The SDK calls verify_token for every HTTP request that carries a bearer token. The log
+    names the colleague, never the token: a log is read by more people than .env."""
+
+    def __init__(self, tokens: dict[str, str]):
+        self.tokens = tokens
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        name = self.tokens.get(token)
+        if name is None:
+            log.warning("HTTP request refused: unknown token")
+            return None
+        log.info("HTTP request from %s", name)
+        return AccessToken(token=token, client_id=name, scopes=[], resource=RESOURCE)
+
+
+mcp = MCPServer(
+    "pachatraining", lifespan=lifespan, request_state_security=request_state_security(),
+    # Over HTTP, a request without a known token gets 401 before any JSON-RPC is read.
+    # Over stdio and in memory there is no Authorization header: the verifier is never called.
+    token_verifier=TeamTokens(team_tokens()),
+    auth=AuthSettings(
+        # No authorization server issues these tokens: they are drawn and handed out by
+        # hand. AuthSettings asks for an issuer all the same, and the protected resource
+        # metadata names it.
+        issuer_url=AnyHttpUrl(f"http://127.0.0.1:{HTTP_PORT}"),
+        resource_server_url=AnyHttpUrl(RESOURCE),
+        validate_token_resource=True,
+    ),
+)
 
 # Every tool of this server only reads, and only reads the training database. The queries
 # read the views of the Mcp schema: mcp_reader, the account of the server, has no right on
@@ -621,14 +675,35 @@ WRITES = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempoten
                          open_world_hint=False)
 
 
+class Caller(BaseModel):
+    """The colleague a tool that writes acts for: the name PACHA_TOKENS gives the token."""
+    name: str
+
+
+async def writer() -> Caller:
+    """Resolver: who calls a tool that writes. The other resolvers of these tools depend on
+    it, so a caller without a token is refused before the database is read or anyone is
+    asked to confirm.
+
+    Over stdio and in memory there is no token at all, and the tools that write refuse."""
+    token = get_access_token()
+    if token is None:
+        raise ToolError("This tool writes, and writes only for a caller with a team token: "
+                        "serve over HTTP (pachatraining-mcp --http) and send the token.")
+    return Caller(name=token.client_id)
+
+
 class SessionToMove(BaseModel):
     session_id: int
     course_code: str
     start_date: date
 
 
-def find_session(session_id: int) -> SessionToMove:
-    """Resolver: the session as it is now, read where the tool writes."""
+def find_session(
+    session_id: int,
+    caller: Annotated[Caller, Resolve(writer)],
+) -> SessionToMove:
+    """Resolver: the session as it is now, read where the tool writes, for a known caller."""
     with connect(write_database()) as cn:
         cur = cn.cursor()
         cur.execute(
@@ -671,6 +746,7 @@ def postpone_session(
     new_start_date: Annotated[date, Field(description="New start date, as an ISO date.")],
     as_of: Annotated[date, Field(description="Today's date, as an ISO date: the reference "
                                              "date of the call.")],
+    caller: Annotated[Caller, Resolve(writer)],
     session: Annotated[SessionToMove, Resolve(find_session)],
     confirm: Annotated[ElicitationResult[Confirm], Resolve(ask_postpone)],
 ) -> Postponement:
@@ -705,6 +781,7 @@ def postpone_session(
     except mssql_python.DatabaseError as exc:
         # The text of the THROW in the procedure, after the prefixes of the driver.
         raise ToolError(f"Not postponed: {str(exc).rsplit(']', 1)[-1]}") from exc
+    log.info("Session %s postponed to %s by %s", session_id, new_start_date, caller.name)
     return Postponement(session_id=session_id, postponed=True, start_date=new_start_date,
                         message=f"Session {session_id} now starts on {new_start_date}.")
 
@@ -717,9 +794,13 @@ class EnrollmentToCancel(BaseModel):
     trainee: str
 
 
-def find_enrollment(enrollment_id: int) -> EnrollmentToCancel:
-    """Resolver: the enrollment and its trainee, by display name only (Mcp.EnrollmentSummary).
-    An enrollment already cancelled is refused here, before anyone is asked."""
+def find_enrollment(
+    enrollment_id: int,
+    caller: Annotated[Caller, Resolve(writer)],
+) -> EnrollmentToCancel:
+    """Resolver: the enrollment and its trainee, by display name only (Mcp.EnrollmentSummary),
+    for a known caller. An enrollment already cancelled is refused here, before anyone is
+    asked."""
     with connect(write_database()) as cn:
         cur = cn.cursor()
         cur.execute(
@@ -765,6 +846,7 @@ def cancel_enrollment(
                                  description="Why the enrollment is cancelled.")],
     as_of: Annotated[date, Field(description="Today's date, as an ISO date: it becomes the "
                                              "cancellation date.")],
+    caller: Annotated[Caller, Resolve(writer)],
     enrollment: Annotated[EnrollmentToCancel, Resolve(find_enrollment)],
     confirm: Annotated[ElicitationResult[ConfirmCancel], Resolve(ask_cancel)],
 ) -> Cancellation:
@@ -790,6 +872,7 @@ def cancel_enrollment(
             cur.fetchone()
     except mssql_python.DatabaseError as exc:
         raise ToolError(f"Not cancelled: {str(exc).rsplit(']', 1)[-1]}") from exc
+    log.info("Enrollment %s cancelled by %s", enrollment_id, caller.name)
     return Cancellation(enrollment_id=enrollment_id, cancelled=True,
                         message=f"Enrollment {enrollment_id} of {enrollment.trainee} cancelled "
                                 f"on {as_of}.")
@@ -818,12 +901,15 @@ def main() -> None:
     """Serve over stdio, as a host starts the server, or over Streamable HTTP with --http."""
     parser = argparse.ArgumentParser(prog="pachatraining-mcp")
     parser.add_argument("--http", action="store_true",
-                        help="serve Streamable HTTP on 127.0.0.1, port PACHA_HTTP_PORT (8000)")
+                        help="serve Streamable HTTP on 127.0.0.1, port PACHA_HTTP_PORT (8000), "
+                             "to the holders of a token of PACHA_TOKENS")
     args = parser.parse_args()
     if args.http:
+        if not team_tokens():
+            parser.error("PACHA_TOKENS is empty: over HTTP, every request would get 401. "
+                         "Draw a token with: uv run python setup/new_token.py <name>")
         # 127.0.0.1 only: the team's names are the Host headers a proxy in front will send.
-        mcp.run(transport="streamable-http", host="127.0.0.1",
-                port=int(os.environ.get("PACHA_HTTP_PORT", "8000")),
+        mcp.run(transport="streamable-http", host="127.0.0.1", port=HTTP_PORT,
                 transport_security=transport_security())
     else:
         mcp.run()

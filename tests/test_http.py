@@ -1,74 +1,19 @@
 """The server over Streamable HTTP, started as the team starts it: pachatraining-mcp --http.
 
 Each test talks to a real process on a free port of 127.0.0.1, with the SDK client or with
-plain HTTP requests: the in-memory client goes through no transport, so it cannot tell
-whether the server checks a Host header or seals a confirmation with a shared key.
+plain HTTP requests, and with a team token: the in-memory client goes through no transport,
+so it cannot tell whether the server checks a Host header or seals a confirmation with a
+shared key.
 """
 
-import os
 import secrets
-import socket
 import subprocess
-import time
-from contextlib import contextmanager
-from pathlib import Path
 
 import httpx2
 import pytest
-from mcp import Client
 
+from tests.http_server import REVISION, ROOT, free_port, http_client, http_server, post, wait_for
 from tools.wire_summary import summarize
-
-ROOT = Path(__file__).resolve().parents[1]
-REVISION = "2026-07-28"
-META = {
-    "io.modelcontextprotocol/protocolVersion": REVISION,
-    "io.modelcontextprotocol/clientInfo": {"name": "test_http", "version": "1"},
-    "io.modelcontextprotocol/clientCapabilities": {"elicitation": {"form": {}}},
-}
-
-
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-@contextmanager
-def http_server(**env: str):
-    """Start pachatraining-mcp --http on a free port, wait until it listens, stop it after."""
-    port = free_port()
-    process = subprocess.Popen(
-        ["uv", "--directory", str(ROOT), "run", "--quiet", "pachatraining-mcp", "--http"],
-        env={**os.environ, "PACHA_HTTP_PORT": str(port), **env},
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    try:
-        deadline = time.monotonic() + 30
-        while True:
-            try:
-                socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
-                break
-            except OSError:
-                if process.poll() is not None or time.monotonic() > deadline:
-                    raise RuntimeError("pachatraining-mcp --http does not listen") from None
-                time.sleep(0.1)
-        yield port
-    finally:
-        process.terminate()
-        process.wait(timeout=10)
-
-
-def post(port: int, method: str, params: dict | None = None, name: str | None = None,
-         **headers: str) -> httpx2.Response:
-    """One modern request, with the headers the 2026-07-28 revision asks for."""
-    sent = {"MCP-Protocol-Version": REVISION, "Mcp-Method": method,
-            "Accept": "application/json, text/event-stream"}
-    if name:
-        sent["Mcp-Name"] = name
-    sent.update({k.replace("_", "-"): v for k, v in headers.items()})
-    body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": {**(params or {}), "_meta": META}}
-    return httpx2.post(f"http://127.0.0.1:{port}/mcp", json=body, headers=sent, timeout=30)
 
 
 @pytest.fixture(scope="module")
@@ -79,7 +24,7 @@ def port():
 
 @pytest.mark.anyio
 async def test_tools_over_http(port: int):
-    async with Client(f"http://127.0.0.1:{port}/mcp") as client:
+    async with http_client(port) as client:
         assert client.protocol_version == REVISION
         result = await client.call_tool("sessions_in_week", {"monday": "2026-11-16"})
     assert not result.is_error, result.content[0].text
@@ -104,16 +49,10 @@ async def test_wire_log_over_http(port: int):
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
-        deadline = time.monotonic() + 30
-        while True:
-            try:
-                socket.create_connection(("127.0.0.1", proxy_port), timeout=0.2).close()
-                break
-            except OSError:
-                if proxy.poll() is not None or time.monotonic() > deadline:
-                    raise RuntimeError("tools/wire_http.py does not listen") from None
-                time.sleep(0.1)
-        async with Client(f"http://127.0.0.1:{proxy_port}/mcp") as client:
+        wait_for(proxy_port, proxy, "tools/wire_http.py")
+        # Refused at the door: a 401 the summary must not take for an MCP answer.
+        assert post(proxy_port, "server/discover", token=None).status_code == 401
+        async with http_client(proxy_port) as client:
             result = await client.call_tool("sessions_in_week", {"monday": "2026-11-16"})
         assert result.structured_content["count"] == 36
     finally:

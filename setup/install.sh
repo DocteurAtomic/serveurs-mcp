@@ -67,4 +67,4 @@ sql < setup/restore.sql
 sql -e PACHA_APP_PASSWORD -e MCP_READER_PASSWORD < setup/accounts.sql
 DB=PachadataTraining sql -e DB < setup/mcp-schema.sql
 for m in m07 m09; do ENGINE=$engine ./setup/reset-copy.sh "$m" --if-missing; done
-echo "Lab ready: SQL Server on localhost,${SQLPORT:-14733}, database PachadataTraining."
+echo "Lab ready: SQL Server on 127.0.0.1,${SQLPORT:-14733}, database PachadataTraining."

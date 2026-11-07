@@ -1,0 +1,32 @@
+# Builds the lab and the project on every push, on every tag and on every pull request:
+# restores the database, checks the numbers the videos show, then runs the tests if the
+# project has any yet (module-01-start has none).
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Start the lab, restore the database, create the accounts and the copies
+        run: ./setup/install.sh
+      - name: Install Python and the project
+        run: uv sync --locked
+      - name: Check the lab
+        run: uv run python setup/check_lab.py
+      - name: Tests
+        run: |
+          if compgen -G "tests/test_*.py" > /dev/null; then
+            uv run pytest -q
+          else
+            echo "No tests in this state of the project."
+          fi

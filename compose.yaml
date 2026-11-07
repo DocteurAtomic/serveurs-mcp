@@ -1,0 +1,27 @@
+# Lab of the course: SQL Server 2025 Developer with PachadataTraining.
+# Start it, restore the database and create the accounts with: ./setup/install.sh
+# The passwords come from .env, which install.sh writes on its first run (never committed).
+# The image only exists for linux/amd64: the platform line lets Docker Desktop emulate it
+# on an Apple silicon Mac without any setting.
+services:
+  sql:
+    image: mcr.microsoft.com/mssql/server:2025-CU7-ubuntu-24.04
+    platform: linux/amd64
+    container_name: mcpcourse
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?run ./setup/install.sh first, it writes .env}
+      SQLCMDPASSWORD: ${MSSQL_SA_PASSWORD:?run ./setup/install.sh first, it writes .env}
+    ports:
+      - "127.0.0.1:${SQLPORT:-14733}:1433"
+    mem_limit: 2g
+    volumes:
+      - sqldata:/var/opt/mssql
+    healthcheck:
+      test: ["CMD", "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa", "-C", "-Q", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+volumes:
+  sqldata:

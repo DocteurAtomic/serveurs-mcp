@@ -443,5 +443,98 @@ def unpaid_invoices(
                       invoices=invoices, next_cursor=next_cursor)
 
 
+WATCH_PAGE = 20
+WatchStatus = Literal["OPEN", "PLANNED"]
+
+
+class SessionToWatch(BaseModel):
+    session_id: int
+    start_date: date
+    course_code: str
+    status: WatchStatus
+    enrolled: Annotated[int, Field(description="Enrollments that are not cancelled.")]
+    max_attendees: int
+
+
+class WatchPage(BaseModel):
+    from_date: date
+    to_date: date
+    total: Annotated[int, Field(description="Sessions to watch over all pages, not this one.")]
+    sessions: list[SessionToWatch]
+    next_cursor: Annotated[
+        str | None,
+        Field(description="Pass it back as cursor for the next page; absent on the last page."),
+    ] = None
+
+
+class _WatchPosition(BaseModel):
+    from_date: date
+    to_date: date
+    start_date: date
+    session_id: int
+
+
+# Sessions not confirmed yet whose enrollments, cancellations left out, fill less than half
+# of the seats of the course.
+TO_WATCH = """
+    FROM Course.Session AS s
+    JOIN Course.Course AS c ON c.CourseId = s.CourseId
+    CROSS APPLY (SELECT COUNT(*) AS Enrolled FROM Enrollment.Enrollment AS e
+                 WHERE e.SessionId = s.SessionId AND e.CancellationDate IS NULL) AS f
+    WHERE s.StartDate >= ? AND s.StartDate <= ? AND s.StatusCode IN ('PLANNED', 'OPEN')
+      AND f.Enrolled * 2 < c.MaxAttendees"""
+
+
+@mcp.tool(title="Sessions to watch", annotations=READ_ONLY)
+def sessions_to_watch(
+    from_date: Annotated[date, Field(description="First start date, as an ISO date.")],
+    to_date: Annotated[date, Field(description="Last start date, included; 92 days at most.")],
+    cursor: Annotated[
+        str | None, Field(description="next_cursor of the previous page; omit for the first.")
+    ] = None,
+) -> WatchPage:
+    """List the sessions PLANNED or OPEN that start from `from_date` to `to_date` and are less
+    than half full, by start date then id, 20 per page. `total` covers all pages: when
+    `next_cursor` is present, call again with it to get the next page.
+    """
+    if to_date < from_date or (to_date - from_date).days > 92:
+        raise ToolError("The period runs from from_date to to_date, 92 days at most.")
+    after = None
+    if cursor:
+        try:
+            after = _WatchPosition.model_validate_json(base64.urlsafe_b64decode(cursor.encode()))
+        except ValueError:
+            raise ToolError(
+                "Invalid cursor: pass back the next_cursor of the previous page as is.")
+        if (after.from_date, after.to_date) != (from_date, to_date):
+            raise ToolError("This cursor belongs to another period: start again without it.")
+    with connect() as cn:
+        cur = cn.cursor()
+        cur.execute(f"SELECT COUNT(*) {TO_WATCH}", (from_date, to_date))
+        total = cur.fetchone()[0]
+        cur.execute(
+            f"""SELECT TOP (?) s.SessionId, s.StartDate, c.Code, s.StatusCode, f.Enrolled,
+                       c.MaxAttendees
+                {TO_WATCH}
+                  AND (? IS NULL OR s.StartDate > ? OR (s.StartDate = ? AND s.SessionId > ?))
+                ORDER BY s.StartDate, s.SessionId""",
+            (WATCH_PAGE + 1, from_date, to_date,
+             after and after.start_date, after and after.start_date, after and after.start_date,
+             after and after.session_id),
+        )
+        rows = cur.fetchall()
+    sessions = [SessionToWatch(session_id=r[0], start_date=r[1], course_code=r[2],
+                               status=r[3].strip(), enrolled=r[4], max_attendees=r[5])
+                for r in rows[:WATCH_PAGE]]
+    next_cursor = None
+    if len(rows) > WATCH_PAGE:
+        last = sessions[-1]
+        position = _WatchPosition(from_date=from_date, to_date=to_date,
+                                  start_date=last.start_date, session_id=last.session_id)
+        next_cursor = base64.urlsafe_b64encode(position.model_dump_json().encode()).decode()
+    return WatchPage(from_date=from_date, to_date=to_date, total=total, sessions=sessions,
+                     next_cursor=next_cursor)
+
+
 def main() -> None:
     mcp.run()

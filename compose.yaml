@@ -47,5 +47,39 @@ services:
     mem_limit: 1536m
     volumes:
       - ./setup/keycloak:/opt/keycloak/data/import:ro,z
+  # The MCP server of module 13, built from the Dockerfile, in the server profile: neither
+  # ./setup/install.sh nor the CI start it. Start it with:
+  #   docker compose --profile server up -d --build mcp
+  # It reaches SQL Server by its service name, on the network compose gives the project, and
+  # gets only the variables it reads: the sa password stays out of its environment.
+  mcp:
+    build: .
+    image: pachatraining-mcp
+    profiles: [server]
+    container_name: mcpcourse-mcp
+    depends_on:
+      sql:
+        condition: service_healthy
+    environment:
+      PACHA_SQL_SERVER: sql,1433
+      PACHA_SQL_DATABASE: ${PACHA_SQL_DATABASE:-PachadataTraining}
+      PACHA_SQL_WRITE_DATABASE: ${PACHA_SQL_WRITE_DATABASE:-PachadataTraining_m07}
+      PACHA_SQL_USER: ${PACHA_SQL_USER:-mcp_reader}
+      PACHA_SQL_PASSWORD: ${PACHA_SQL_PASSWORD:?run ./setup/install.sh first, it writes .env}
+      PACHA_TOKENS: ${PACHA_TOKENS:-}
+      PACHA_READ_TOKENS: ${PACHA_READ_TOKENS:-}
+      PACHA_REQUEST_STATE_KEY: ${PACHA_REQUEST_STATE_KEY:-}
+      PACHA_HTTP_HOSTS: ${PACHA_HTTP_HOSTS:-}
+      # The address the clients use, on the host: the port inside the container stays 8000.
+      PACHA_MCP_URL: http://127.0.0.1:${MCP_PORT:-8000}/mcp
+    ports:
+      - "127.0.0.1:${MCP_PORT:-8000}:8000"
+    mem_limit: 512m
+    # The process listens: the protected resource metadata answers 200 without a token.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/.well-known/oauth-protected-resource/mcp', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 volumes:
   sqldata:

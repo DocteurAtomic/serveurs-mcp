@@ -1,6 +1,7 @@
-# Builds the lab and the project on every push, on every tag and on every pull request:
-# restores the database, checks the numbers the videos show, then runs the tests if the
-# project has any yet (module-01-start has none).
+# Builds the lab, the project and the image of the server on every push, on every tag and on
+# every pull request: restores the database, checks the numbers the videos show, builds the
+# image, then runs the whole suite, the tests of the image included, and requires exactly the
+# number of tests below to pass. A skipped test fails the run: it tested nothing.
 name: ci
 
 on:
@@ -14,6 +15,10 @@ jobs:
   lab:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # The number of tests of this state of the project. Change it with the tests.
+      EXPECTED_TESTS: 71
+      PACHA_IMAGE: pachatraining-mcp
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -23,10 +28,15 @@ jobs:
         run: uv sync --locked
       - name: Check the lab
         run: uv run python setup/check_lab.py
+      - name: Build the image of the server
+        run: docker build -t "$PACHA_IMAGE" .
       - name: Tests
         run: |
-          if compgen -G "tests/test_*.py" > /dev/null; then
-            uv run pytest -q
-          else
-            echo "No tests in this state of the project."
+          set -o pipefail
+          uv run pytest -q -p no:cacheprovider | tee pytest.txt
+          last=$(tail -n 1 pytest.txt)
+          expected="^$EXPECTED_TESTS passed(, [0-9]+ warnings?)? in "
+          if ! [[ $last =~ $expected ]]; then
+            echo "Expected exactly $EXPECTED_TESTS passed tests, and nothing skipped: $last"
+            exit 1
           fi

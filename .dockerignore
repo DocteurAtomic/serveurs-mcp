@@ -1,0 +1,7 @@
+# Only what the image needs goes to the build: never .env, which holds the passwords.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+**/__pycache__

@@ -83,7 +83,9 @@ def request_state_security() -> RequestStateSecurity | None:
 
 log = logging.getLogger("pachatraining")
 
-# Where the HTTP server answers.
+# Where the HTTP server answers. 127.0.0.1 by default: this machine only. In a container,
+# 127.0.0.1 is the container itself, and the image sets PACHA_HTTP_LISTEN=0.0.0.0.
+HTTP_LISTEN = os.environ.get("PACHA_HTTP_LISTEN") or "127.0.0.1"
 HTTP_PORT = int(os.environ.get("PACHA_HTTP_PORT", "8000"))
 # The resource the tokens are for: the URL the clients connect to. By default the server's
 # own address; PACHA_MCP_URL when the clients reach it by another one (the URL the
@@ -958,12 +960,15 @@ LOCAL_HOSTS = ["127.0.0.1", "localhost", "[::1]"]
 def transport_security() -> TransportSecuritySettings | None:
     """The Host and Origin headers the HTTP server accepts.
 
-    Without PACHA_HTTP_HOSTS, None: the SDK's default for 127.0.0.1, the names of this
+    Without PACHA_HTTP_HOSTS, on 127.0.0.1, None: the SDK's default, the names of this
     machine only. With it (names separated by commas, the names the team will use to reach
     the server), those names too, with or without a port. The list replaces the default,
-    so the names of this machine are listed again."""
+    so the names of this machine are listed again.
+
+    On any other address (0.0.0.0 in a container), the SDK turns its check off: every Host
+    would pass. The list is then always given, so the check stays on."""
     names = [n.strip() for n in os.environ.get("PACHA_HTTP_HOSTS", "").split(",") if n.strip()]
-    if not names:
+    if not names and HTTP_LISTEN == "127.0.0.1":
         return None
     hosts = [h for name in LOCAL_HOSTS + names for h in (name, f"{name}:*")]
     origins = [f"{scheme}://{h}" for h in hosts for scheme in ("http", "https")]
@@ -974,7 +979,8 @@ def main() -> None:
     """Serve over stdio, as a host starts the server, or over Streamable HTTP with --http."""
     parser = argparse.ArgumentParser(prog="pachatraining-mcp")
     parser.add_argument("--http", action="store_true",
-                        help="serve Streamable HTTP on 127.0.0.1, port PACHA_HTTP_PORT (8000), "
+                        help="serve Streamable HTTP on PACHA_HTTP_LISTEN (127.0.0.1), port "
+                             "PACHA_HTTP_PORT (8000), "
                              "to the holders of a token of PACHA_OAUTH_ISSUER, or of "
                              "PACHA_TOKENS or PACHA_READ_TOKENS when it is unset")
     args = parser.parse_args()
@@ -983,8 +989,9 @@ def main() -> None:
             parser.error("PACHA_TOKENS is empty and PACHA_OAUTH_ISSUER is unset: over HTTP, "
                          "every request would get 401. Draw a token with: "
                          "uv run python setup/new_token.py <name>")
-        # 127.0.0.1 only: the team's names are the Host headers a proxy in front will send.
-        mcp.run(transport="streamable-http", host="127.0.0.1", port=HTTP_PORT,
+        # 127.0.0.1 unless PACHA_HTTP_LISTEN says otherwise: the team's names are the Host
+        # headers a proxy in front will send, never addresses to listen on.
+        mcp.run(transport="streamable-http", host=HTTP_LISTEN, port=HTTP_PORT,
                 transport_security=transport_security())
     else:
         mcp.run()

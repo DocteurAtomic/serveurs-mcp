@@ -63,6 +63,27 @@ secret, `docker rm -f mcpcourse-keycloak`, puis relancer le script. Avec Podman 
 `COMPOSE="podman compose" uv run python setup/keycloak.py`. La console :
 `http://127.0.0.1:8080/admin`, compte `admin`.
 
+## Le serveur en conteneur (module 13)
+
+    docker build -t pachatraining-mcp .
+    docker compose --profile server up -d mcp
+
+Le `Dockerfile` construit l'image du serveur en deux étapes : `uv` installe les dépendances
+verrouillées et le projet dans un environnement, que la seconde étape copie seul, sans `uv`
+ni source, avec un utilisateur sans droits. Aucun secret n'y entre : `.dockerignore` écarte
+`.env`, et le service `mcp` de `compose.yaml`, dans le profil `server`, passe au conteneur les
+seules variables que le serveur lit, mot de passe de `mcp_reader` et jetons compris, jamais
+celui de `sa`. Dans le conteneur, le serveur écoute sur `0.0.0.0` (`PACHA_HTTP_LISTEN`) ; le
+port est publié sur `127.0.0.1:8000` de l'hôte (`MCP_PORT` le change), et le serveur garde son
+contrôle de l'en-tête `Host`. Il joint SQL Server par le nom du service, `sql,1433`, sur le
+réseau que compose donne au projet. Avec `podman-compose` 1.6, les valeurs des variables
+passent sur la ligne de commande de `podman` : préférez `docker compose`, ou lancez
+`podman run` avec `-e NOM` sans valeur.
+
+La CI construit l'image, lance toute la suite, les tests de l'image compris
+(`PACHA_IMAGE=pachatraining-mcp`), et exige le nombre de tests écrit dans le workflow : un
+test sauté la fait échouer.
+
 ## Dépannage
 
 - Mac à puce Apple : l'image SQL Server n'existe que pour `linux/amd64` ; le `compose.yaml` le
@@ -105,5 +126,10 @@ settings if the container stops at startup. The `mssql-python` driver brings Mic
 Driver 18 (`mssql-python-odbc`), free but under a proprietary license. Module 12 adds Keycloak, a service of the
 `oauth` profile of `compose.yaml` that neither `install.sh` nor the CI starts:
 `uv run python setup/keycloak.py` draws its secrets into `.env` and starts it on
-`127.0.0.1:8080` (1 GB more memory, and Internet access from its container). The
+`127.0.0.1:8080` (1 GB more memory, and Internet access from its container). Module 13
+adds the `Dockerfile` (two stages with uv, a user without rights, no secret: `.dockerignore`
+keeps `.env` out) and the `mcp` service of the `server` profile: `docker build -t
+pachatraining-mcp .`, then `docker compose --profile server up -d mcp`, which publishes the
+server on `127.0.0.1:8000` and passes it only the variables it reads. The CI builds the image
+and requires the number of tests written in the workflow, so a skipped test fails it. The
 code is released under the MIT license.

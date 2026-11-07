@@ -1,0 +1,85 @@
+# Lab of the course: SQL Server 2025 Developer with PachadataTraining.
+# Start it, restore the database and create the accounts with: ./setup/install.sh
+# The passwords come from .env, which install.sh writes on its first run (never committed).
+# The image only exists for linux/amd64: the platform line lets Docker Desktop emulate it
+# on an Apple silicon Mac without any setting.
+services:
+  sql:
+    image: mcr.microsoft.com/mssql/server:2025-CU7-ubuntu-24.04
+    platform: linux/amd64
+    container_name: mcpcourse
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?run ./setup/install.sh first, it writes .env}
+      SQLCMDPASSWORD: ${MSSQL_SA_PASSWORD:?run ./setup/install.sh first, it writes .env}
+    ports:
+      - "127.0.0.1:${SQLPORT:-14733}:1433"
+    mem_limit: 2g
+    volumes:
+      - sqldata:/var/opt/mssql
+    healthcheck:
+      test: ["CMD", "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa", "-C", "-Q", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  # The authorization server of module 12: Keycloak, which imports the pachadata realm of
+  # setup/keycloak/ when it starts, its ${...} values read from .env. In the oauth profile, so
+  # ./setup/install.sh and the CI do not start it: ./setup/keycloak.py does, after filling its
+  # secrets in .env. Development mode, plain HTTP on 127.0.0.1 only, about 1 GB of memory.
+  # CIMD and RFC 8707 (resource indicators) are experimental features of 26.8.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.2
+    profiles: [oauth]
+    container_name: mcpcourse-keycloak
+    command: ["start-dev", "--import-realm", "--features=cimd,resource-indicators"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-}
+      KEYCLOAK_ALICE_PASSWORD: ${KEYCLOAK_ALICE_PASSWORD:-}
+      KEYCLOAK_CAROL_PASSWORD: ${KEYCLOAK_CAROL_PASSWORD:-}
+      KEYCLOAK_MCP_SECRET: ${KEYCLOAK_MCP_SECRET:-}
+      KEYCLOAK_CHECK_SECRET: ${KEYCLOAK_CHECK_SECRET:-}
+      # The URL of the MCP server, written in the audience of the tokens.
+      PACHA_MCP_URL: ${PACHA_MCP_URL:-http://127.0.0.1:8000/mcp}
+    ports:
+      - "127.0.0.1:${KEYCLOAK_PORT:-8080}:8080"
+    mem_limit: 1536m
+    volumes:
+      - ./setup/keycloak:/opt/keycloak/data/import:ro,z
+  # The MCP server of module 13, built from the Dockerfile, in the server profile: neither
+  # ./setup/install.sh nor the CI start it. Start it with:
+  #   docker compose --profile server up -d --build mcp
+  # It reaches SQL Server by its service name, on the network compose gives the project, and
+  # gets only the variables it reads: the sa password stays out of its environment.
+  mcp:
+    build: .
+    image: pachatraining-mcp
+    profiles: [server]
+    container_name: mcpcourse-mcp
+    depends_on:
+      sql:
+        condition: service_healthy
+    environment:
+      PACHA_SQL_SERVER: sql,1433
+      PACHA_SQL_DATABASE: ${PACHA_SQL_DATABASE:-PachadataTraining}
+      PACHA_SQL_WRITE_DATABASE: ${PACHA_SQL_WRITE_DATABASE:-PachadataTraining_m07}
+      PACHA_SQL_USER: ${PACHA_SQL_USER:-mcp_reader}
+      PACHA_SQL_PASSWORD: ${PACHA_SQL_PASSWORD:?run ./setup/install.sh first, it writes .env}
+      PACHA_TOKENS: ${PACHA_TOKENS:-}
+      PACHA_READ_TOKENS: ${PACHA_READ_TOKENS:-}
+      PACHA_REQUEST_STATE_KEY: ${PACHA_REQUEST_STATE_KEY:-}
+      PACHA_HTTP_HOSTS: ${PACHA_HTTP_HOSTS:-}
+      # The address the clients use, on the host: the port inside the container stays 8000.
+      PACHA_MCP_URL: http://127.0.0.1:${MCP_PORT:-8000}/mcp
+    ports:
+      - "127.0.0.1:${MCP_PORT:-8000}:8000"
+    mem_limit: 512m
+    # The server answers and reaches the base: /health says 200 only when SELECT 1 does.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  sqldata:

@@ -647,5 +647,91 @@ def postpone_session(
                         message=f"Session {session_id} now starts on {new_start_date}.")
 
 
+class EnrollmentToCancel(BaseModel):
+    enrollment_id: int
+    session_id: int
+    course_code: str
+    session_start_date: date
+    trainee: str
+
+
+def find_enrollment(enrollment_id: int) -> EnrollmentToCancel:
+    """Resolver: the enrollment and its trainee, by display name only (Mcp.EnrollmentSummary).
+    An enrollment already cancelled is refused here, before anyone is asked."""
+    with connect(write_database()) as cn:
+        cur = cn.cursor()
+        cur.execute(
+            """SELECT EnrollmentId, SessionId, CourseCode, SessionStartDate, TraineeName,
+                      CancellationDate
+               FROM Mcp.EnrollmentSummary WHERE EnrollmentId = ?""",
+            (enrollment_id,),
+        )
+        r = cur.fetchone()
+    if r is None:
+        raise ToolError(f"Enrollment {enrollment_id} not found.")
+    if r[5] is not None:
+        raise ToolError(f"Enrollment {enrollment_id} was already cancelled on {r[5]}.")
+    return EnrollmentToCancel(enrollment_id=r[0], session_id=r[1], course_code=r[2],
+                              session_start_date=r[3], trainee=r[4])
+
+
+class ConfirmCancel(BaseModel):
+    confirm: bool = Field(description="Tick to cancel the enrollment.")
+
+
+def ask_cancel(
+    enrollment: Annotated[EnrollmentToCancel, Resolve(find_enrollment)],
+) -> Elicit[ConfirmCancel]:
+    """Resolver: name the trainee and the session the user is about to change."""
+    return Elicit(
+        f"Cancel the enrollment of {enrollment.trainee} in session {enrollment.session_id} "
+        f"({enrollment.course_code}, {enrollment.session_start_date})?",
+        ConfirmCancel,
+    )
+
+
+class Cancellation(BaseModel):
+    enrollment_id: int
+    cancelled: bool
+    message: str
+
+
+@mcp.tool(title="Cancel an enrollment", annotations=WRITES)
+def cancel_enrollment(
+    enrollment_id: Annotated[int, Field(ge=1, description="Id of the enrollment to cancel.")],
+    reason: Annotated[str, Field(min_length=1, max_length=200,
+                                 description="Why the enrollment is cancelled.")],
+    as_of: Annotated[date, Field(description="Today's date, as an ISO date: it becomes the "
+                                             "cancellation date.")],
+    enrollment: Annotated[EnrollmentToCancel, Resolve(find_enrollment)],
+    confirm: Annotated[ElicitationResult[ConfirmCancel], Resolve(ask_cancel)],
+) -> Cancellation:
+    """Cancel one enrollment of a trainee in a session, after the user confirms it. The server
+    asks the user itself: do not ask for a confirmation in the conversation.
+
+    An enrollment already cancelled, or in a session completed or cancelled, cannot be
+    cancelled: the result then says why.
+    """
+    match confirm:
+        case AcceptedElicitation(data=ConfirmCancel(confirm=True)):
+            pass
+        case _:
+            why = "not confirmed" if confirm.action == "accept" else confirm.action
+            return Cancellation(enrollment_id=enrollment_id, cancelled=False,
+                                message=f"Not cancelled ({why}): enrollment "
+                                        f"{enrollment_id} of {enrollment.trainee} is kept.")
+    try:
+        with connect(write_database()) as cn:
+            cur = cn.cursor()
+            cur.execute("EXEC Mcp.CancelEnrollment @EnrollmentId = ?, @Reason = ?, @AsOf = ?",
+                        (enrollment_id, reason, as_of))
+            cur.fetchone()
+    except mssql_python.DatabaseError as exc:
+        raise ToolError(f"Not cancelled: {str(exc).rsplit(']', 1)[-1]}") from exc
+    return Cancellation(enrollment_id=enrollment_id, cancelled=True,
+                        message=f"Enrollment {enrollment_id} of {enrollment.trainee} cancelled "
+                                f"on {as_of}.")
+
+
 def main() -> None:
     mcp.run()

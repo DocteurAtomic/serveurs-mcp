@@ -13,6 +13,14 @@ from typing import Annotated, Literal
 import anyio.to_thread
 import mssql_python
 from mcp.server import MCPServer
+from mcp.server.mcpserver import (
+    AcceptedElicitation,
+    CancelledElicitation,
+    DeclinedElicitation,
+    Elicit,
+    ElicitationResult,
+    Resolve,
+)
 from mcp.server.mcpserver.exceptions import ResourceNotFoundError, ToolError
 from mcp.types import (
     Completion,
@@ -61,12 +69,14 @@ mcp = MCPServer("pachatraining", lifespan=lifespan)
 READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 
 
-def connect() -> mssql_python.Connection:
+def connect(database: str | None = None) -> mssql_python.Connection:
     """Open a connection with the account of .env (pacha_app), never sa. Use it in a with
-    block: leaving the block hands the connection back to the pool."""
+    block: leaving the block commits, or rolls back on an exception, and hands the connection
+    back to the pool."""
+    database = database or os.environ.get("PACHA_SQL_DATABASE", "PachadataTraining")
     return mssql_python.connect(
         f"Server={os.environ['PACHA_SQL_SERVER']};"
-        f"Database={os.environ.get('PACHA_SQL_DATABASE', 'PachadataTraining')};"
+        f"Database={database};"
         f"UID={os.environ['PACHA_SQL_USER']};PWD={os.environ['PACHA_SQL_PASSWORD']};"
         "Encrypt=yes;TrustServerCertificate=yes"
     )
@@ -534,6 +544,107 @@ def sessions_to_watch(
         next_cursor = base64.urlsafe_b64encode(position.model_dump_json().encode()).decode()
     return WatchPage(from_date=from_date, to_date=to_date, total=total, sessions=sessions,
                      next_cursor=next_cursor)
+
+
+# The tools that write do it in this database. In the lab, a copy that ./setup/reset-copy.sh
+# m07 recreates, so that the reference database keeps the numbers the other tests check.
+def write_database() -> str:
+    return os.environ.get("PACHA_SQL_WRITE_DATABASE", "PachadataTraining_m07")
+
+
+# Hints for the client, not a protection: the database refuses what the account may not do.
+WRITES = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False,
+                         open_world_hint=False)
+
+
+class SessionToMove(BaseModel):
+    session_id: int
+    course_code: str
+    start_date: date
+
+
+def find_session(session_id: int) -> SessionToMove:
+    """Resolver: the session as it is now, read where the tool writes."""
+    with connect(write_database()) as cn:
+        cur = cn.cursor()
+        cur.execute(
+            """SELECT s.SessionId, c.Code, s.StartDate
+               FROM Course.Session AS s JOIN Course.Course AS c ON c.CourseId = s.CourseId
+               WHERE s.SessionId = ?""",
+            (session_id,),
+        )
+        r = cur.fetchone()
+    if r is None:
+        raise ToolError(f"Session {session_id} not found.")
+    return SessionToMove(session_id=r[0], course_code=r[1], start_date=r[2])
+
+
+class Confirm(BaseModel):
+    confirm: bool = Field(description="Tick to postpone the session.")
+
+
+def ask_postpone(
+    new_start_date: date,
+    session: Annotated[SessionToMove, Resolve(find_session)],
+) -> Elicit[Confirm]:
+    """Resolver: ask the user, with what they need to decide. The message is built from the
+    arguments and the database only, so it reads the same at every round of the call."""
+    return Elicit(
+        f"Postpone session {session.session_id} ({session.course_code}) "
+        f"from {session.start_date} to {new_start_date}?",
+        Confirm,
+    )
+
+
+class Postponement(BaseModel):
+    session_id: int
+    postponed: bool
+    start_date: Annotated[date, Field(description="Start date of the session after the call.")]
+    message: str
+
+
+@mcp.tool(title="Postpone a session", annotations=WRITES)
+def postpone_session(
+    session_id: Annotated[int, Field(ge=1, description="Id of the session to postpone.")],
+    new_start_date: Annotated[date, Field(description="New start date, as an ISO date.")],
+    as_of: Annotated[date, Field(description="Today's date, as an ISO date: the reference "
+                                             "date of the call.")],
+    session: Annotated[SessionToMove, Resolve(find_session)],
+    confirm: Annotated[ElicitationResult[Confirm], Resolve(ask_postpone)],
+) -> Postponement:
+    """Move the start date of one training session, after the user confirms it. The server
+    asks the user itself: do not ask for a confirmation in the conversation.
+
+    A session that is completed or cancelled, or that started before `as_of`, cannot be
+    postponed, nor moved to a date before `as_of`: the result then says why.
+    """
+    kept = f"session {session_id} still starts on {session.start_date}."
+    match confirm:
+        case AcceptedElicitation(data=Confirm(confirm=True)):
+            pass
+        case AcceptedElicitation():
+            return Postponement(session_id=session_id, postponed=False,
+                                start_date=session.start_date, message=f"Not confirmed: {kept}")
+        case DeclinedElicitation():
+            return Postponement(session_id=session_id, postponed=False,
+                                start_date=session.start_date,
+                                message=f"The user declined: {kept}")
+        case CancelledElicitation():
+            return Postponement(session_id=session_id, postponed=False,
+                                start_date=session.start_date,
+                                message=f"No answer from the user: {kept}")
+    try:
+        with connect(write_database()) as cn:
+            cur = cn.cursor()
+            # The procedure checks and writes in one transaction: no SQL of the server writes.
+            cur.execute("EXEC Mcp.PostponeSession @SessionId = ?, @NewStartDate = ?, @AsOf = ?",
+                        (session_id, new_start_date, as_of))
+            cur.fetchone()
+    except mssql_python.DatabaseError as exc:
+        # The text of the THROW in the procedure, after the prefixes of the driver.
+        raise ToolError(f"Not postponed: {str(exc).rsplit(']', 1)[-1]}") from exc
+    return Postponement(session_id=session_id, postponed=True, start_date=new_start_date,
+                        message=f"Session {session_id} now starts on {new_start_date}.")
 
 
 def main() -> None:

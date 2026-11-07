@@ -7,8 +7,15 @@ from typing import Annotated, Literal
 
 import mssql_python
 from mcp.server import MCPServer
-from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.server.mcpserver.exceptions import ResourceNotFoundError, ToolError
+from mcp.types import (
+    Completion,
+    CompletionArgument,
+    CompletionContext,
+    PromptReference,
+    ResourceTemplateReference,
+    ToolAnnotations,
+)
 from pydantic import BaseModel, Field
 
 # The .env at the root of the project, wherever the host starts the server from.
@@ -176,6 +183,107 @@ def trainer_load(
         )
         count, days = cur.fetchone()
     return TrainerLoad(trainer_id=trainer_id, month=month, sessions=count, days=float(days))
+
+
+@mcp.resource("pachatraining://session-statuses", title="Session statuses",
+              mime_type="text/markdown")
+def session_statuses() -> str:
+    """The five statuses a training session can be in (Course.SessionStatus), with their labels."""
+    with connect() as cn:
+        cur = cn.cursor()
+        cur.execute("SELECT StatusCode, Label FROM Course.SessionStatus ORDER BY StatusCode")
+        rows = cur.fetchall()
+    return "# Session statuses\n\n" + "\n".join(f"- `{r[0].strip()}`: {r[1]}" for r in rows) + "\n"
+
+
+@mcp.resource("pachatraining://course/{code}", title="Course sheet", mime_type="text/markdown")
+def course_sheet(code: str) -> str:
+    """The sheet of one course, by its code (LNX-ADM2): English title, summary, audience,
+    prerequisites, objectives, duration and size of a session."""
+    with connect() as cn:
+        cur = cn.cursor()
+        cur.execute(
+            """SELECT c.Code, cl.Title, cl.Subtitle, cl.Summary, cl.TargetAudience,
+                      cl.Prerequisites, cl.Objectives, c.Duration, c.MaxAttendees,
+                      c.CancellationDate
+               FROM Course.Course AS c
+               LEFT JOIN Course.CourseLanguage AS cl
+                      ON cl.CourseId = c.CourseId AND cl.LanguageCode = 'EN'
+               WHERE c.Code = ?""",
+            (code,),
+        )
+        r = cur.fetchone()
+    if r is None:
+        # The client receives -32602 with this message; any other exception would be -32603.
+        raise ResourceNotFoundError(f"No course with code {code}.")
+    lines = [f"# {r[0]}: {r[1]}", ""]
+    if r[2]:
+        lines += [f"*{r[2]}*", ""]
+    lines += [r[3] or "", "",
+              f"- Duration: {r[7]} days", f"- Trainees per session: at most {r[8]}",
+              f"- Audience: {r[4]}", f"- Prerequisites: {r[5]}"]
+    if r[9]:
+        lines += [f"- Cancellation date: {r[9]:%Y-%m-%d}"]
+    lines += ["", "## Objectives", ""]
+    lines += [f"- {o.strip()}" for o in (r[6] or "").split(";") if o.strip()]
+    return "\n".join(lines) + "\n"
+
+
+@mcp.prompt(title="Review of a week")
+def review_week(
+    monday: Annotated[str, Field(description="Monday of the week, as an ISO date (2026-11-16).")],
+) -> str:
+    """Review the training sessions of one week the way the planning team does it."""
+    return (
+        f"Review the training week that starts on Monday {monday}.\n\n"
+        f"1. Call the sessions_in_week tool once, with monday={monday}.\n"
+        "2. Give the number of sessions by status.\n"
+        "3. List the sessions that are not CONFIRMED yet, by start date, with their id and"
+        " course code.\n"
+        "4. End with one sentence on what the planning team should check first.\n\n"
+        "Rely on the tool result only, and write the review in French."
+    )
+
+
+def course_codes(prefix: str) -> tuple[list[str], int]:
+    """The course codes that start with prefix, at most 100, and how many there are."""
+    with connect() as cn:
+        cur = cn.cursor()
+        cur.execute("SELECT Code FROM Course.Course ORDER BY Code")
+        codes = [r[0] for r in cur.fetchall() if r[0].startswith(prefix.upper())]
+    return codes[:100], len(codes)
+
+
+def mondays(prefix: str) -> tuple[list[str], int]:
+    """The Mondays of the weeks that have sessions, written as ISO dates that start with prefix."""
+    with connect() as cn:
+        cur = cn.cursor()
+        # 1900-01-01 was a Monday: the number of days since then, modulo 7, goes back to it.
+        cur.execute(
+            """SELECT DISTINCT CONVERT(char(10), DATEADD(day,
+                      -(DATEDIFF(day, '19000101', StartDate) % 7), StartDate), 23) AS m
+               FROM Course.Session
+               ORDER BY m"""
+        )
+        days = [r[0] for r in cur.fetchall() if r[0].startswith(prefix)]
+    return days[:100], len(days)
+
+
+@mcp.completion()
+async def complete(
+    ref: PromptReference | ResourceTemplateReference,
+    argument: CompletionArgument,
+    context: CompletionContext | None,
+) -> Completion | None:
+    """Suggest course codes for the course sheet, and Mondays for the review of a week."""
+    if isinstance(ref, ResourceTemplateReference) and argument.name == "code":
+        values, total = course_codes(argument.value)
+    elif isinstance(ref, PromptReference) and argument.name == "monday":
+        values, total = mondays(argument.value)
+    else:
+        return None
+    # A response holds 100 values at most: total and has_more say what was left out.
+    return Completion(values=values, total=total, has_more=total > len(values))
 
 
 def main() -> None:

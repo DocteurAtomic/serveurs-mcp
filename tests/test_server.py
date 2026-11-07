@@ -56,3 +56,16 @@ async def test_arguments_are_checked_before_the_function():
     assert "'CANCELED', 'COMPLETED', 'CONFIRMED', 'OPEN' or 'PLANNED'" in late.content[0].text
     assert zero.is_error
     assert "greater than or equal to 1" in zero.content[0].text
+
+
+@pytest.mark.anyio
+async def test_trainer_load():
+    async with Client(mcp) as client:
+        result = await client.call_tool("trainer_load", {"trainer_id": 38, "month": "2026-10"})
+        missing = await client.call_tool("trainer_load", {"trainer_id": 999, "month": "2026-10"})
+    assert not result.is_error
+    assert result.structured_content == {
+        "trainer_id": 38, "month": "2026-10", "sessions": 3, "days": 6.0,
+    }
+    assert missing.is_error
+    assert missing.content[0].text == "Error executing tool trainer_load: Trainer 999 not found."

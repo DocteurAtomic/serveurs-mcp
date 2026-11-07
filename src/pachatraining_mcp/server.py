@@ -137,5 +137,46 @@ def session_detail(
                          status=r[4].strip(), enrolled=r[5])
 
 
+class TrainerLoad(BaseModel):
+    trainer_id: int
+    month: str
+    sessions: Annotated[
+        int, Field(description="Engagements of the trainer in sessions starting that month.")
+    ]
+    days: Annotated[float, Field(description="Days billed by the trainer for those sessions.")]
+
+
+@mcp.tool(title="Load of a trainer", annotations=READ_ONLY)
+def trainer_load(
+    trainer_id: Annotated[int, Field(ge=1, description="Id of the trainer (Trainer.Trainer).")],
+    month: Annotated[
+        str,
+        Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$", description="Month, as YYYY-MM (2026-10)."),
+    ],
+) -> TrainerLoad:
+    """Count the sessions a trainer is engaged for in one month, and the days billed for them,
+    from the trainer engagements (Trainer.Engagement). A session belongs to the month it
+    starts in.
+
+    Engagements are recorded up to mid-October 2026: a later month returns zero.
+    """
+    first = date(int(month[:4]), int(month[5:]), 1)
+    after = date(first.year + first.month // 12, first.month % 12 + 1, 1)
+    with connect() as cn:
+        cur = cn.cursor()
+        cur.execute("SELECT 1 FROM Trainer.Trainer WHERE TrainerId = ?", (trainer_id,))
+        if cur.fetchone() is None:
+            raise ToolError(f"Trainer {trainer_id} not found.")
+        cur.execute(
+            """SELECT COUNT(*), COALESCE(SUM(e.DayCount), 0)
+               FROM Trainer.Engagement AS e
+               JOIN Course.Session AS s ON s.SessionId = e.SessionId
+               WHERE e.TrainerId = ? AND s.StartDate >= ? AND s.StartDate < ?""",
+            (trainer_id, first, after),
+        )
+        count, days = cur.fetchone()
+    return TrainerLoad(trainer_id=trainer_id, month=month, sessions=count, days=float(days))
+
+
 def main() -> None:
     mcp.run()

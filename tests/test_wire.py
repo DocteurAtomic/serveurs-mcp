@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import anyio
 import pytest
 from mcp import Client, StdioServerParameters
 
@@ -20,9 +21,11 @@ async def test_wire_log_of_one_start(mode, revision, first_method):
     tag = f"test-{mode}"
     # The client starts tools/wire.sh with PATH and HOME only: the server reads its own .env.
     params = StdioServerParameters(command="bash", args=[WIRE, tag])
-    async with Client(params, mode=mode) as client:
-        assert client.protocol_version == revision
-        result = await client.call_tool("sessions_in_week", {"monday": "2026-11-16"})
+    # A server that dies at start leaves the legacy client waiting forever: fail instead.
+    with anyio.fail_after(30):
+        async with Client(params, mode=mode) as client:
+            assert client.protocol_version == revision
+            result = await client.call_tool("sessions_in_week", {"monday": "2026-11-16"})
     assert not result.is_error, result.content[0].text
     assert result.structured_content["count"] == 36
     wire = summarize(tag, ROOT / "logs")

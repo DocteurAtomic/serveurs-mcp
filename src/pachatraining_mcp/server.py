@@ -1,6 +1,7 @@
 """The pachatraining MCP server: what PachaData's teams ask of the training database."""
 
 import os
+import re
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Annotated, Literal
@@ -284,6 +285,37 @@ async def complete(
         return None
     # A response holds 100 values at most: total and has_more say what was left out.
     return Completion(values=values, total=total, has_more=total > len(values))
+
+
+@mcp.resource("pachatraining://trainer/{trainer_id}/month/{month}", title="Load of a trainer",
+              mime_type="text/markdown")
+def trainer_month(trainer_id: int, month: str) -> str:
+    """The load of one trainer in one month (YYYY-MM): sessions engaged for, and days billed."""
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
+        raise ResourceNotFoundError(f"Month {month} is not written as YYYY-MM.")
+    try:
+        load = trainer_load(trainer_id, month)
+    except ToolError as exc:
+        # A ToolError is meant for a tool result: out of a resource it would reach the client
+        # as -32603, with a message that names only the URI.
+        raise ResourceNotFoundError(str(exc)) from exc
+    return (f"# Trainer {trainer_id}, {month}\n\n"
+            f"- Sessions: {load.sessions}\n- Days billed: {load.days}\n")
+
+
+@mcp.prompt(title="Review of a trainer's month")
+def trainer_review(
+    trainer_id: Annotated[str, Field(description="Id of the trainer (Trainer.Trainer).")],
+    month: Annotated[str, Field(description="Month, as YYYY-MM (2026-10).")],
+) -> str:
+    """Review the load of one trainer in one month the way the planning team does it."""
+    return (
+        f"Review the load of trainer {trainer_id} in {month}.\n\n"
+        f"1. Call the trainer_load tool once, with trainer_id={trainer_id} and month={month}.\n"
+        "2. Give the number of sessions and the days billed.\n"
+        "3. Say in one sentence whether the load looks light, normal or heavy for one month.\n\n"
+        "Rely on the tool result only, and write the review in French."
+    )
 
 
 def main() -> None:

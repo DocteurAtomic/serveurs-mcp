@@ -1,0 +1,11 @@
+# The answers of my own run on 7 November 2026 (Claude Code 2.1.319, Inspector CLI 2.14.0).
+# Yours are compared with your own logs: Claude Code may speak another revision elsewhere.
+[inspector]
+revision = "2025-11-25"
+first_method = "initialize"
+tool_calls = 1
+
+[claude]
+revision = "2026-07-28"
+first_method = "server/discover"
+tool_calls = 1

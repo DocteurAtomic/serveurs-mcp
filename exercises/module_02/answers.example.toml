@@ -1,0 +1,10 @@
+# Copy to answers.toml and fill in what your two logs show.
+[inspector]
+revision = ""        # e.g. "2025-11-25"
+first_method = ""    # the first method the client sent
+tool_calls = 0       # how many tools/call the log holds
+
+[claude]
+revision = ""
+first_method = ""
+tool_calls = 0

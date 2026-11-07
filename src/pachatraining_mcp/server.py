@@ -1,5 +1,6 @@
 """The pachatraining MCP server: what PachaData's teams ask of the training database."""
 
+import argparse
 import base64
 import json
 import os
@@ -19,6 +20,7 @@ from mcp.server.mcpserver import (
     DeclinedElicitation,
     Elicit,
     ElicitationResult,
+    RequestStateSecurity,
     Resolve,
 )
 from mcp.server.mcpserver.exceptions import ResourceNotFoundError, ToolError
@@ -63,7 +65,18 @@ async def lifespan(server: MCPServer) -> AsyncIterator[None]:
     yield
 
 
-mcp = MCPServer("pachatraining", lifespan=lifespan)
+def request_state_security() -> RequestStateSecurity | None:
+    """The key that seals the requestState of a confirmation between its two rounds.
+
+    Without PACHA_REQUEST_STATE_KEY the SDK draws a key per process: a retry that reaches
+    another process, or the same one after a restart, is refused. Every process that serves
+    the same clients must share the key, and the server name, which the SDK checks too."""
+    key = os.environ.get("PACHA_REQUEST_STATE_KEY")
+    return RequestStateSecurity(keys=[key]) if key else None
+
+
+mcp = MCPServer("pachatraining", lifespan=lifespan,
+                request_state_security=request_state_security())
 
 # Every tool of this server only reads, and only reads the training database. The queries
 # read the views of the Mcp schema: mcp_reader, the account of the server, has no right on
@@ -782,4 +795,14 @@ def cancel_enrollment(
 
 
 def main() -> None:
-    mcp.run()
+    """Serve over stdio, as a host starts the server, or over Streamable HTTP with --http."""
+    parser = argparse.ArgumentParser(prog="pachatraining-mcp")
+    parser.add_argument("--http", action="store_true",
+                        help="serve Streamable HTTP on 127.0.0.1, port PACHA_HTTP_PORT (8000)")
+    args = parser.parse_args()
+    if args.http:
+        # 127.0.0.1 only: the SDK then accepts the Host headers of this machine and no other.
+        mcp.run(transport="streamable-http", host="127.0.0.1",
+                port=int(os.environ.get("PACHA_HTTP_PORT", "8000")))
+    else:
+        mcp.run()

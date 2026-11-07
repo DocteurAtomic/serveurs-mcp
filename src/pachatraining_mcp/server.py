@@ -24,6 +24,7 @@ from mcp.server.mcpserver import (
     Resolve,
 )
 from mcp.server.mcpserver.exceptions import ResourceNotFoundError, ToolError
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import (
     Completion,
     CompletionArgument,
@@ -794,6 +795,25 @@ def cancel_enrollment(
                                 f"on {as_of}.")
 
 
+# The names the SDK accepts by default when it listens on 127.0.0.1.
+LOCAL_HOSTS = ["127.0.0.1", "localhost", "[::1]"]
+
+
+def transport_security() -> TransportSecuritySettings | None:
+    """The Host and Origin headers the HTTP server accepts.
+
+    Without PACHA_HTTP_HOSTS, None: the SDK's default for 127.0.0.1, the names of this
+    machine only. With it (names separated by commas, the names the team will use to reach
+    the server), those names too, with or without a port. The list replaces the default,
+    so the names of this machine are listed again."""
+    names = [n.strip() for n in os.environ.get("PACHA_HTTP_HOSTS", "").split(",") if n.strip()]
+    if not names:
+        return None
+    hosts = [h for name in LOCAL_HOSTS + names for h in (name, f"{name}:*")]
+    origins = [f"{scheme}://{h}" for h in hosts for scheme in ("http", "https")]
+    return TransportSecuritySettings(allowed_hosts=hosts, allowed_origins=origins)
+
+
 def main() -> None:
     """Serve over stdio, as a host starts the server, or over Streamable HTTP with --http."""
     parser = argparse.ArgumentParser(prog="pachatraining-mcp")
@@ -801,8 +821,9 @@ def main() -> None:
                         help="serve Streamable HTTP on 127.0.0.1, port PACHA_HTTP_PORT (8000)")
     args = parser.parse_args()
     if args.http:
-        # 127.0.0.1 only: the SDK then accepts the Host headers of this machine and no other.
+        # 127.0.0.1 only: the team's names are the Host headers a proxy in front will send.
         mcp.run(transport="streamable-http", host="127.0.0.1",
-                port=int(os.environ.get("PACHA_HTTP_PORT", "8000")))
+                port=int(os.environ.get("PACHA_HTTP_PORT", "8000")),
+                transport_security=transport_security())
     else:
         mcp.run()

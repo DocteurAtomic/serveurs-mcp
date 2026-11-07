@@ -153,3 +153,10 @@ def test_confirmation_needs_a_shared_key():
     result = answered.json()["result"]["structuredContent"]
     assert result["postponed"] is False
     assert result["message"].startswith("The user declined")
+
+
+def test_the_team_names():
+    with http_server(PACHA_HTTP_HOSTS="mcp.pachadata.example") as p:
+        assert post(p, "server/discover", Host="mcp.pachadata.example").status_code == 200
+        assert post(p, "server/discover", Host=f"127.0.0.1:{p}").status_code == 200
+        assert post(p, "server/discover", Host="evil.example").status_code == 421

@@ -65,14 +65,17 @@ async def lifespan(server: MCPServer) -> AsyncIterator[None]:
 
 mcp = MCPServer("pachatraining", lifespan=lifespan)
 
-# Every tool of this server only reads, and only reads the training database.
+# Every tool of this server only reads, and only reads the training database. The queries
+# read the views of the Mcp schema: mcp_reader, the account of the server, has no right on
+# the tables.
 READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 
 
 def connect(database: str | None = None) -> mssql_python.Connection:
-    """Open a connection with the account of .env (pacha_app), never sa. Use it in a with
-    block: leaving the block commits, or rolls back on an exception, and hands the connection
-    back to the pool."""
+    """Open a connection with the account of .env, never sa: mcp_reader from module 8 on,
+    which may only read the views of the Mcp schema and run its two procedures. Use it in a with block: leaving
+    the block commits, or rolls back on an exception, and hands the connection back to the
+    pool."""
     database = database or os.environ.get("PACHA_SQL_DATABASE", "PachadataTraining")
     return mssql_python.connect(
         f"Server={os.environ['PACHA_SQL_SERVER']};"
@@ -117,19 +120,15 @@ def sessions_in_week(
     with connect() as cn:
         cur = cn.cursor()
         cur.execute(
-            """SELECT s.SessionId, s.StartDate, c.Code, cl.Title, s.StatusCode
-               FROM Course.Session AS s
-               JOIN Course.Course AS c ON c.CourseId = s.CourseId
-               LEFT JOIN Course.CourseLanguage AS cl
-                      ON cl.CourseId = s.CourseId AND cl.LanguageCode = 'EN'
-               WHERE s.StartDate >= ? AND s.StartDate < ?
-                 AND (? IS NULL OR s.StatusCode = ?)
-               ORDER BY s.StartDate, s.SessionId""",
+            """SELECT SessionId, StartDate, CourseCode, CourseTitle, StatusCode
+               FROM Mcp.SessionSummary
+               WHERE StartDate >= ? AND StartDate < ? AND (? IS NULL OR StatusCode = ?)
+               ORDER BY StartDate, SessionId""",
             (monday, monday + timedelta(days=7), status, status),
         )
         rows = [
             SessionRow(session_id=r[0], start_date=r[1], course_code=r[2],
-                       title=r[3], status=r[4].strip())
+                       title=r[3], status=r[4])
             for r in cur.fetchall()
         ]
     return WeekPlan(monday=monday, count=len(rows), sessions=rows)
@@ -158,14 +157,8 @@ def session_detail(
     with connect() as cn:
         cur = cn.cursor()
         cur.execute(
-            """SELECT s.SessionId, c.Code, cl.Title, s.StartDate, s.StatusCode,
-                      (SELECT COUNT(*) FROM Enrollment.Enrollment AS e
-                       WHERE e.SessionId = s.SessionId AND e.CancellationDate IS NULL)
-               FROM Course.Session AS s
-               JOIN Course.Course AS c ON c.CourseId = s.CourseId
-               LEFT JOIN Course.CourseLanguage AS cl
-                      ON cl.CourseId = s.CourseId AND cl.LanguageCode = 'EN'
-               WHERE s.SessionId = ?""",
+            """SELECT SessionId, CourseCode, CourseTitle, StartDate, StatusCode, EnrolledCount
+               FROM Mcp.SessionDetail WHERE SessionId = ?""",
             (session_id,),
         )
         r = cur.fetchone()
@@ -173,7 +166,7 @@ def session_detail(
         # A ToolError reaches the model with its message; any other exception would not.
         raise ToolError(f"Session {session_id} not found.")
     return SessionDetail(session_id=r[0], course_code=r[1], title=r[2], start_date=r[3],
-                         status=r[4].strip(), enrolled=r[5])
+                         status=r[4], enrolled=r[5])
 
 
 class TrainerLoad(BaseModel):
@@ -220,12 +213,12 @@ def trainer_load(
 @mcp.resource("pachatraining://session-statuses", title="Session statuses",
               mime_type="text/markdown")
 def session_statuses() -> str:
-    """The five statuses a training session can be in (Course.SessionStatus), with their labels."""
+    """The five statuses a training session can be in, with their labels."""
     with connect() as cn:
         cur = cn.cursor()
-        cur.execute("SELECT StatusCode, Label FROM Course.SessionStatus ORDER BY StatusCode")
+        cur.execute("SELECT StatusCode, Label FROM Mcp.SessionStatus ORDER BY StatusCode")
         rows = cur.fetchall()
-    return "# Session statuses\n\n" + "\n".join(f"- `{r[0].strip()}`: {r[1]}" for r in rows) + "\n"
+    return "# Session statuses\n\n" + "\n".join(f"- `{r[0]}`: {r[1]}" for r in rows) + "\n"
 
 
 @mcp.resource("pachatraining://course/{code}", title="Course sheet", mime_type="text/markdown")
@@ -235,13 +228,9 @@ def course_sheet(code: str) -> str:
     with connect() as cn:
         cur = cn.cursor()
         cur.execute(
-            """SELECT c.Code, cl.Title, cl.Subtitle, cl.Summary, cl.TargetAudience,
-                      cl.Prerequisites, cl.Objectives, c.Duration, c.MaxAttendees,
-                      c.CancellationDate
-               FROM Course.Course AS c
-               LEFT JOIN Course.CourseLanguage AS cl
-                      ON cl.CourseId = c.CourseId AND cl.LanguageCode = 'EN'
-               WHERE c.Code = ?""",
+            """SELECT CourseCode, Title, Subtitle, Summary, TargetAudience, Prerequisites,
+                      Objectives, Duration, MaxAttendees, CancellationDate
+               FROM Mcp.CourseSheet WHERE CourseCode = ? AND LanguageCode = 'EN'""",
             (code,),
         )
         r = cur.fetchone()
@@ -281,7 +270,8 @@ def course_codes(prefix: str) -> tuple[list[str], int]:
     """The course codes that start with prefix, at most 100, and how many there are."""
     with connect() as cn:
         cur = cn.cursor()
-        cur.execute("SELECT Code FROM Course.Course ORDER BY Code")
+        cur.execute("SELECT CourseCode FROM Mcp.CourseSheet WHERE LanguageCode = 'EN' "
+                    "ORDER BY CourseCode")
         codes = [r[0] for r in cur.fetchall() if r[0].startswith(prefix.upper())]
     return codes[:100], len(codes)
 
@@ -294,7 +284,7 @@ def mondays(prefix: str) -> tuple[list[str], int]:
         cur.execute(
             """SELECT DISTINCT CONVERT(char(10), DATEADD(day,
                       -(DATEDIFF(day, '19000101', StartDate) % 7), StartDate), 23) AS m
-               FROM Course.Session
+               FROM Mcp.SessionSummary
                ORDER BY m"""
         )
         days = [r[0] for r in cur.fetchall() if r[0].startswith(prefix)]
@@ -395,16 +385,9 @@ def _decode(cursor: str, as_of: date, days: int) -> _Position:
     return position
 
 
-# Invoices only (DocumentType 'I'; 'A' is a credit note), whose payments do not cover the gross
-# amount, due before the cut-off date. Payments are summed whatever their date.
-UNPAID = """
-    FROM Enrollment.Invoice AS i
-    LEFT JOIN (SELECT InvoiceCode, SUM(Amount) AS Paid
-               FROM Enrollment.Payment GROUP BY InvoiceCode) AS p
-           ON p.InvoiceCode = i.InvoiceCode
-    LEFT JOIN Contact.Company AS co ON co.CompanyId = i.CompanyId
-    LEFT JOIN Contact.Contact AS ct ON ct.ContactId = i.ContactId
-    WHERE i.DocumentType = 'I' AND i.GrossAmount > ISNULL(p.Paid, 0) AND i.DueDate < ?"""
+# Invoices only (not credit notes) whose payments, summed whatever their date, do not cover
+# the gross amount (Mcp.UnpaidInvoice), due before the cut-off date.
+UNPAID = "FROM Mcp.UnpaidInvoice WHERE DueDate < ?"
 
 
 @mcp.tool(title="Unpaid invoices", annotations=READ_ONLY)
@@ -425,17 +408,15 @@ def unpaid_invoices(
     after = _decode(cursor, as_of, days) if cursor else None
     with connect() as cn:
         cur = cn.cursor()
-        cur.execute(f"SELECT COUNT(*), SUM(i.GrossAmount - ISNULL(p.Paid, 0)) {UNPAID}", (cutoff,))
+        cur.execute(f"SELECT COUNT(*), SUM(AmountDue) {UNPAID}", (cutoff,))
         total, total_due = cur.fetchone()
         # One row more than a page says whether there is a next one. The order is unique
         # (InvoiceCode breaks the ties of DueDate), so the pages never overlap nor skip a row.
         cur.execute(
-            f"""SELECT TOP (?) i.InvoiceCode, i.DueDate,
-                       COALESCE(co.Name, CONCAT(ct.FirstName, ' ', ct.LastName)),
-                       i.GrossAmount - ISNULL(p.Paid, 0)
+            f"""SELECT TOP (?) InvoiceCode, DueDate, ClientName, AmountDue
                 {UNPAID}
-                  AND (? IS NULL OR i.DueDate > ? OR (i.DueDate = ? AND i.InvoiceCode > ?))
-                ORDER BY i.DueDate, i.InvoiceCode""",
+                  AND (? IS NULL OR DueDate > ? OR (DueDate = ? AND InvoiceCode > ?))
+                ORDER BY DueDate, InvoiceCode""",
             (PAGE_SIZE + 1, cutoff,
              after and after.due_date, after and after.due_date, after and after.due_date,
              after and after.invoice_code),
@@ -487,12 +468,9 @@ class _WatchPosition(BaseModel):
 # Sessions not confirmed yet whose enrollments, cancellations left out, fill less than half
 # of the seats of the course.
 TO_WATCH = """
-    FROM Course.Session AS s
-    JOIN Course.Course AS c ON c.CourseId = s.CourseId
-    CROSS APPLY (SELECT COUNT(*) AS Enrolled FROM Enrollment.Enrollment AS e
-                 WHERE e.SessionId = s.SessionId AND e.CancellationDate IS NULL) AS f
-    WHERE s.StartDate >= ? AND s.StartDate <= ? AND s.StatusCode IN ('PLANNED', 'OPEN')
-      AND f.Enrolled * 2 < c.MaxAttendees"""
+    FROM Mcp.SessionFill
+    WHERE StartDate >= ? AND StartDate <= ? AND StatusCode IN ('PLANNED', 'OPEN')
+      AND EnrolledCount * 2 < MaxAttendees"""
 
 
 @mcp.tool(title="Sessions to watch", annotations=READ_ONLY)
@@ -523,18 +501,18 @@ def sessions_to_watch(
         cur.execute(f"SELECT COUNT(*) {TO_WATCH}", (from_date, to_date))
         total = cur.fetchone()[0]
         cur.execute(
-            f"""SELECT TOP (?) s.SessionId, s.StartDate, c.Code, s.StatusCode, f.Enrolled,
-                       c.MaxAttendees
+            f"""SELECT TOP (?) SessionId, StartDate, CourseCode, StatusCode, EnrolledCount,
+                       MaxAttendees
                 {TO_WATCH}
-                  AND (? IS NULL OR s.StartDate > ? OR (s.StartDate = ? AND s.SessionId > ?))
-                ORDER BY s.StartDate, s.SessionId""",
+                  AND (? IS NULL OR StartDate > ? OR (StartDate = ? AND SessionId > ?))
+                ORDER BY StartDate, SessionId""",
             (WATCH_PAGE + 1, from_date, to_date,
              after and after.start_date, after and after.start_date, after and after.start_date,
              after and after.session_id),
         )
         rows = cur.fetchall()
     sessions = [SessionToWatch(session_id=r[0], start_date=r[1], course_code=r[2],
-                               status=r[3].strip(), enrolled=r[4], max_attendees=r[5])
+                               status=r[3], enrolled=r[4], max_attendees=r[5])
                 for r in rows[:WATCH_PAGE]]
     next_cursor = None
     if len(rows) > WATCH_PAGE:
@@ -568,9 +546,7 @@ def find_session(session_id: int) -> SessionToMove:
     with connect(write_database()) as cn:
         cur = cn.cursor()
         cur.execute(
-            """SELECT s.SessionId, c.Code, s.StartDate
-               FROM Course.Session AS s JOIN Course.Course AS c ON c.CourseId = s.CourseId
-               WHERE s.SessionId = ?""",
+            "SELECT SessionId, CourseCode, StartDate FROM Mcp.SessionDetail WHERE SessionId = ?",
             (session_id,),
         )
         r = cur.fetchone()

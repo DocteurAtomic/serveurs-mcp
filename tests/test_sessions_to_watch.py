@@ -9,16 +9,15 @@ pytestmark = pytest.mark.anyio
 
 PERIOD = {"from_date": "2026-11-16", "to_date": "2026-12-31"}
 
-# The query of the README, run here as the server's account: the result the pages must cover.
+# The rule of the README, run here as the server's account on another view than the one the
+# server reads (Mcp.SessionFill): the result the pages must cover.
 REFERENCE = """
-    SELECT s.SessionId
-    FROM Course.Session AS s
-    JOIN Course.Course AS c ON c.CourseId = s.CourseId
-    WHERE s.StartDate BETWEEN ? AND ?
-      AND s.StatusCode IN ('PLANNED', 'OPEN')
-      AND (SELECT COUNT(*) FROM Enrollment.Enrollment AS e
-           WHERE e.SessionId = s.SessionId AND e.CancellationDate IS NULL) * 2 < c.MaxAttendees
-    ORDER BY s.StartDate, s.SessionId"""
+    SELECT SessionId
+    FROM Mcp.SessionDetail
+    WHERE StartDate BETWEEN ? AND ?
+      AND StatusCode IN ('PLANNED', 'OPEN')
+      AND EnrolledCount * 2 < MaxAttendees
+    ORDER BY StartDate, SessionId"""
 
 
 async def pages(client: Client, args: dict) -> list[dict]:
